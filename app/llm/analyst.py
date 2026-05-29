@@ -9,10 +9,18 @@ import json
 import logging
 from typing import Optional
 from app.config import settings
+from app.redaction import redact_pii
 
 logger = logging.getLogger(__name__)
 
-client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+# Bound the call: the SDK default timeout is ~10 minutes, which would block the
+# single-task Celery worker and break the "<2s, alert before the ticket" promise.
+# We own retries at the Celery level, so disable the SDK's internal retries too.
+client = anthropic.Anthropic(
+    api_key=settings.ANTHROPIC_API_KEY,
+    timeout=10.0,
+    max_retries=0,
+)
 
 SYSTEM_PROMPT = """You are Earlybird, an expert incident analyst for a fintech platform.
 
@@ -97,7 +105,8 @@ def build_incident_context(
         "countries": countries,
         "severity": severity,
         "score": score,
-        "error_message": message,
+        # Redact PII before the error text leaves our boundary to Anthropic.
+        "error_message": redact_pii(message),
         "exception_type": exception_type,
         "first_seen_at": first_seen_at,
         "last_seen_at": last_seen_at,

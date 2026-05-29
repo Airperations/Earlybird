@@ -1,0 +1,176 @@
+"""initial schema (7 tables) + hot-path indexes
+
+Revision ID: 0001_initial_schema
+Revises:
+Create Date: 2026-05-28
+
+Hand-authored to match app/models.py. Includes the affected_user_ids column
+(audit fix C4) and indexes on the dedup/matcher hot paths (audit recommendation #2).
+"""
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+revision = "0001_initial_schema"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "raw_events",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("source", sa.String(50), nullable=False),
+        sa.Column("received_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("event_timestamp", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("raw_payload", postgresql.JSONB(), nullable=False),
+        sa.Column("processed", sa.Boolean(), nullable=True),
+        sa.Column("idempotency_key", sa.String(64), nullable=True),
+    )
+    op.create_index("ix_raw_events_idempotency_key", "raw_events", ["idempotency_key"], unique=True)
+
+    op.create_table(
+        "normalized_events",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("raw_event_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("raw_events.id"), nullable=True),
+        sa.Column("source", sa.String(50)),
+        sa.Column("service", sa.String(100)),
+        sa.Column("environment", sa.String(50)),
+        sa.Column("endpoint", sa.String(255)),
+        sa.Column("url", sa.String(500)),
+        sa.Column("http_status", sa.Integer(), nullable=True),
+        sa.Column("exception_type", sa.String(255), nullable=True),
+        sa.Column("message", sa.Text(), nullable=True),
+        sa.Column("user_id", sa.String(255), nullable=True),
+        sa.Column("country", sa.String(10), nullable=True),
+        sa.Column("platform", sa.String(50), nullable=True),
+        sa.Column("release", sa.String(100), nullable=True),
+        sa.Column("fingerprint", sa.String(255), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index("ix_normalized_events_fingerprint", "normalized_events", ["fingerprint"])
+
+    op.create_table(
+        "incidents",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("fingerprint", sa.String(255), nullable=False),
+        sa.Column("title", sa.String(500), nullable=True),
+        sa.Column("status", sa.String(50), nullable=False, server_default="new"),
+        sa.Column("severity", sa.String(20), nullable=True),
+        sa.Column("score", sa.Integer(), server_default="0"),
+        sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("affected_users_count", sa.Integer(), server_default="0"),
+        sa.Column("affected_user_ids", postgresql.JSONB(), nullable=True),
+        sa.Column("event_count", sa.Integer(), server_default="1"),
+        sa.Column("countries", postgresql.JSONB(), nullable=True),
+        sa.Column("agent_alert_timestamp", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("slack_message_id", sa.String(255), nullable=True),
+        sa.Column("llm_summary", postgresql.JSONB(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index("ix_incidents_fingerprint", "incidents", ["fingerprint"], unique=True)
+    op.create_index("ix_incidents_status", "incidents", ["status"])
+    op.create_index("ix_incidents_agent_alert_timestamp", "incidents", ["agent_alert_timestamp"])
+    op.create_index("ix_incidents_last_seen_at", "incidents", ["last_seen_at"])
+
+    op.create_table(
+        "incident_events",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("incident_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("incidents.id"), nullable=True),
+        sa.Column("normalized_event_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("normalized_events.id"), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    )
+
+    op.create_table(
+        "freshdesk_tickets",
+        sa.Column("id", sa.String(50), primary_key=True),
+        sa.Column("subject", sa.Text(), nullable=True),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("requester_email", sa.String(255), nullable=True),
+        sa.Column("tags", postgresql.JSONB(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("raw_payload", postgresql.JSONB(), nullable=True),
+        sa.Column("synced_at", sa.DateTime(timezone=True), nullable=False),
+    )
+
+    op.create_table(
+        "incident_freshdesk_matches",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("incident_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("incidents.id"), nullable=True),
+        sa.Column("freshdesk_ticket_id", sa.String(50), sa.ForeignKey("freshdesk_tickets.id"), nullable=True),
+        sa.Column("agent_alert_timestamp", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("freshdesk_ticket_timestamp", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("time_delta_seconds", sa.Integer(), nullable=True),
+        sa.Column("outcome", sa.String(20), nullable=False),
+        sa.Column("confidence", sa.Float(), nullable=True),
+        sa.Column("evidence", postgresql.JSONB(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    )
+    op.create_index(
+        "ix_incident_freshdesk_matches_ticket",
+        "incident_freshdesk_matches",
+        ["freshdesk_ticket_id"],
+    )
+
+    op.create_table(
+        "audit_log",
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column("incident_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("event", sa.String(255), nullable=False),
+        sa.Column("timestamp", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("details", postgresql.JSONB(), nullable=True),
+    )
+    # Make the audit trail genuinely append-only: a BEFORE UPDATE/DELETE trigger
+    # rejects any mutation, so "immutable evidence" is enforced by the database
+    # rather than by convention. (A complementary hardening is to grant the app
+    # role only INSERT/SELECT on this table; the trigger protects even superusers.)
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION earlybird_audit_log_immutable()
+        RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'audit_log is append-only; % is not permitted', TG_OP;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER audit_log_no_update_delete
+        BEFORE UPDATE OR DELETE ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION earlybird_audit_log_immutable();
+        """
+    )
+
+    op.create_table(
+        "dead_letter_events",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("source", sa.String(50), nullable=False),
+        sa.Column("raw_payload", postgresql.JSONB(), nullable=False),
+        sa.Column("received_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("error", sa.Text(), nullable=True),
+        sa.Column("failed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("replayed", sa.Boolean(), nullable=True),
+    )
+
+
+def downgrade() -> None:
+    op.drop_table("dead_letter_events")
+    op.execute("DROP TRIGGER IF EXISTS audit_log_no_update_delete ON audit_log")
+    op.execute("DROP FUNCTION IF EXISTS earlybird_audit_log_immutable()")
+    op.drop_table("audit_log")
+    op.drop_index("ix_incident_freshdesk_matches_ticket", table_name="incident_freshdesk_matches")
+    op.drop_table("incident_freshdesk_matches")
+    op.drop_table("freshdesk_tickets")
+    op.drop_table("incident_events")
+    op.drop_index("ix_incidents_last_seen_at", table_name="incidents")
+    op.drop_index("ix_incidents_agent_alert_timestamp", table_name="incidents")
+    op.drop_index("ix_incidents_status", table_name="incidents")
+    op.drop_index("ix_incidents_fingerprint", table_name="incidents")
+    op.drop_table("incidents")
+    op.drop_index("ix_normalized_events_fingerprint", table_name="normalized_events")
+    op.drop_table("normalized_events")
+    op.drop_table("raw_events")

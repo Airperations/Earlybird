@@ -6,6 +6,7 @@ into a unified NormalizedEventSchema.
 
 import hashlib
 import re
+from urllib.parse import urlparse
 from typing import Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -156,10 +157,14 @@ def normalize(source: str, payload: dict) -> NormalizedEventSchema:
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def _extract_endpoint(url: str) -> str:
-    """Extract the base endpoint path, stripping query params and IDs."""
+    """Extract the base endpoint path, stripping scheme/host, query params and IDs."""
     if not url:
         return ""
-    path = url.split("?")[0]
+    # Strip scheme + host so the fingerprint keys on the path, not the domain.
+    parsed = urlparse(url)
+    path = parsed.path if parsed.scheme else url.split("?")[0]
+    if not path:
+        path = url.split("?")[0]
     # Normalize UUIDs and numeric IDs to :id
     path = re.sub(r"/[0-9a-f-]{8,}", "/:id", path)
     path = re.sub(r"/\d+", "/:id", path)

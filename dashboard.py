@@ -4,13 +4,19 @@ Visual demo for judges. Shows the live scoreboard.
 Run with: streamlit run dashboard.py
 """
 
+import os
 import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
 import time
 
-API_BASE = "http://localhost:8000"
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+
+# Sent on dashboard API calls so it works whether or not the API enforces a key.
+DASHBOARD_HEADERS = {}
+if os.getenv("DASHBOARD_API_KEY"):
+    DASHBOARD_HEADERS["x-dashboard-key"] = os.getenv("DASHBOARD_API_KEY")
 
 st.set_page_config(
     page_title="Earlybird — Bounty Dashboard",
@@ -35,7 +41,7 @@ if auto_refresh:
 @st.cache_data(ttl=30)
 def fetch_summary():
     try:
-        r = requests.get(f"{API_BASE}/dashboard/summary", timeout=5)
+        r = requests.get(f"{API_BASE}/dashboard/summary", headers=DASHBOARD_HEADERS, timeout=5)
         return r.json()
     except Exception as e:
         return {"error": str(e)}
@@ -44,7 +50,7 @@ def fetch_summary():
 @st.cache_data(ttl=30)
 def fetch_incidents():
     try:
-        r = requests.get(f"{API_BASE}/dashboard/incidents", timeout=5)
+        r = requests.get(f"{API_BASE}/dashboard/incidents", headers=DASHBOARD_HEADERS, timeout=5)
         return r.json()
     except Exception as e:
         return {"incidents": [], "error": str(e)}
