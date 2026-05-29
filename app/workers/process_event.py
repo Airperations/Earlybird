@@ -2,15 +2,18 @@
 Earlybird — Main Event Processing Worker
 This is the brain of the agent. Runs asynchronously via Celery.
 
-Full pipeline:
-1. Save raw event
+Full pipeline (fast-path alerting):
+1. Save raw event (idempotent)
 2. Normalize
 3. Find/create incident
-4. Score criticality
-5. Decide if alert is needed
-6. Generate LLM summary
-7. Send Slack alert
-8. Mark incident as alerted with timestamp
+4. Score criticality (+ anomaly detection)
+5. Decide if alert is needed (configurable thresholds, critical-path bar, anomaly)
+6. Send MINIMAL Slack alert immediately — NO LLM first
+7. On confirmed delivery, set the official benchmark timestamp + COMMIT
+8. Generate LLM enrichment AFTER delivery, post as a thread follow-up + COMMIT
+
+The benchmark timestamp is never gated on the LLM, so the agent's alert lands as
+early as possible — the whole point of the challenge.
 """
 
 import asyncio
@@ -28,10 +31,9 @@ from app.database import AsyncSessionLocal
 from app.models import RawEvent, DeadLetterEvent
 from app.normalizers.base import normalize
 from app.incidents import service as incident_service
-from app.incidents.scoring import calculate_criticality
-from app.llm.analyst import generate_incident_summary, build_incident_context
-from app.alerts.slack import send_incident_alert
-from app.redaction import redact_summary
+from app.incidents import alerting
+from app.incidents.scoring import calculate_criticality, _score_to_severity
+from app.incidents.anomaly import detect_anomaly
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -199,6 +201,17 @@ async def _process(source: str, payload: dict, received_at_iso: str):
             events_in_window=events_in_window,
         )
 
+        # ── Anomaly detection: catch silent business degradation ─────────────
+        # Product events may carry a metrics payload (failure/pending rates, p95
+        # latency, volume series). A tripped anomaly forces an alert and boosts the
+        # score even when no single error looks severe.
+        anomaly = detect_anomaly(payload.get("metrics") if isinstance(payload, dict) else None)
+        if anomaly.is_anomaly:
+            scoring.total_score += anomaly.severity_boost
+            scoring.severity = _score_to_severity(scoring.total_score)
+            scoring.breakdown["anomaly"] = anomaly.severity_boost
+            logger.info(f"[WORKER] ⚠️ Anomaly detected ({anomaly.kind}): {anomaly.detail}")
+
         await incident_service.update_incident_score(db, incident, scoring)
 
         logger.info(
@@ -206,15 +219,24 @@ async def _process(source: str, payload: dict, received_at_iso: str):
             f"Breakdown: {scoring.breakdown}"
         )
 
-        # ── Step 6: Decide whether to alert ─────────────────────────────────
-        already_alerted = incident.status == "alerted"
+        # ── Step 5: Decide whether to alert ─────────────────────────────────
+        # Critical business actions (e.g. /withdraw) alert at a lower bar so a
+        # low-volume but high-impact financial issue still beats support.
+        threshold = (
+            settings.CRITICAL_BUSINESS_ACTION_THRESHOLD if scoring.is_critical_path
+            else settings.INCIDENT_ALERT_THRESHOLD
+        )
+        already_alerted = (
+            incident.agent_alert_timestamp is not None
+            or incident.status in ("alerted", "enriched", "matched_to_freshdesk")
+        )
         should_alert = (
-            scoring.should_alert(threshold=settings.MEDIUM_SCORE_THRESHOLD)
+            (scoring.total_score >= threshold or anomaly.is_anomaly)
             and not already_alerted
         )
 
         # Cross-worker guard: during a burst, several events for the same
-        # fingerprint can pass the check before the first commits status="alerted".
+        # fingerprint can pass the check before the first commits a delivered alert.
         # Only the lock holder proceeds to alert; the rest skip (no duplicate Slack).
         if should_alert and not _acquire_alert_lock(normalized.fingerprint):
             logger.info(f"[WORKER] Alert lock held for {normalized.fingerprint} — skipping duplicate alert")
@@ -226,66 +248,34 @@ async def _process(source: str, payload: dict, received_at_iso: str):
             await db.commit()
             return
 
-        # Steps 7-9 hold the alert lock. If anything fails before the commit we
-        # release it so a Celery retry can re-attempt the alert (otherwise the lock
-        # would block re-alerting for its whole TTL and the incident would never alert).
+        # ── Step 6+7: minimal immediate alert → delivered timestamp → COMMIT ─
+        # The alert is sent with NO LLM. If anything fails before the commit we
+        # release the lock so a Celery retry can re-attempt (otherwise the lock
+        # would block re-alerting for its whole TTL).
         try:
-            # ── Step 7: Generate LLM summary ─────────────────────────────────
-            llm_context = build_incident_context(
-                fingerprint=normalized.fingerprint,
-                service=normalized.service,
-                endpoint=normalized.endpoint,
-                http_status=normalized.http_status,
-                affected_users=incident.affected_users_count,
-                event_count=incident.event_count,
-                countries=list(incident.countries or []),
-                severity=scoring.severity,
-                score=scoring.total_score,
-                message=normalized.message,
-                exception_type=normalized.exception_type,
-                first_seen_at=incident.first_seen_at.isoformat(),
-                last_seen_at=incident.last_seen_at.isoformat(),
-            )
-
-            # Redact PII from the model output before it is stored or sent to Slack.
-            llm_summary = redact_summary(generate_incident_summary(llm_context))
-
-            # ── Step 8: Send Slack alert ─────────────────────────────────────
-            alert_timestamp = datetime.now(timezone.utc)
-
-            slack_msg_id = send_incident_alert(
-                incident_id=str(incident.id),
-                fingerprint=normalized.fingerprint,
-                severity=scoring.severity,
-                score=scoring.total_score,
-                affected_users=incident.affected_users_count,
-                event_count=incident.event_count,
-                countries=list(incident.countries or []),
-                endpoint=normalized.endpoint,
-                service=normalized.service,
-                agent_alert_timestamp=alert_timestamp,
-                llm_summary=llm_summary,
-                suggested_owner=scoring.suggested_owner,
-            )
-
-            # ── Step 9: Mark incident as alerted (THE BOUNTY TIMESTAMP) ──────
-            # Persist the SAME timestamp captured in Step 8 (before LLM/Slack), so
-            # the DB value used by the matcher matches what Slack showed.
-            title = llm_summary.get("title") if llm_summary else None
-            await incident_service.mark_incident_alerted(
-                db,
-                incident,
-                slack_msg_id,
-                llm_summary,
-                title,
-                alert_timestamp=alert_timestamp,
-                slack_delivered=slack_msg_id is not None,
-            )
-
+            result = await alerting.deliver_alert(db, incident, normalized, scoring)
             raw_event.processed = True
+            # Commit the delivered (or failed) outcome BEFORE enrichment so a crash
+            # mid-enrichment can never lose a real, delivered win.
             await db.commit()
         except Exception:
             _release_alert_lock(normalized.fingerprint)
             raise
+
+        if not result.delivered:
+            logger.error(f"[WORKER] ❌ Alert delivery failed for {incident.id} — no timestamp set")
+            _release_alert_lock(normalized.fingerprint)
+            return
+
+        # ── Step 8: LLM enrichment AFTER delivery (best-effort) → COMMIT ─────
+        # Errors here are swallowed inside enrich_incident; the delivered win stands.
+        try:
+            await alerting.enrich_incident(
+                db, incident, normalized, scoring, thread_ts=result.thread_ts,
+            )
+            await db.commit()
+        except Exception as e:
+            logger.error(f"[WORKER] Enrichment commit failed for {incident.id}: {e}")
+            await db.rollback()
 
         logger.info(f"[WORKER] ✅ Pipeline complete for incident {incident.id}")
