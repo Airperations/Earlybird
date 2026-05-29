@@ -593,8 +593,61 @@ earlybird/
 | GET | `/dashboard/audit` | **Judge audit** — per-incident lifecycle, deltas & immutable trail |
 | GET | `/dashboard/metrics` | Self-built rolling baselines — current vs baseline rates + live anomalies |
 | GET | `/dashboard/win-rate` | Single win rate metric |
+| GET | `/dashboard/ui` | **Visual dashboard** — browser HTML view (last 30 days) |
+| GET | `/dashboard/data` | Consolidated JSON powering the visual dashboard |
 | GET | `/health` | Health check |
 | GET | `/docs` | Interactive API docs |
+
+---
+
+## Visual Dashboard
+
+A lightweight, **read-only** browser dashboard that summarizes Earlybird's
+product/agent metrics for the **last 30 days** (default range, no backfill
+required). It's plain server-rendered HTML with inline CSS — no React/Vue/Next,
+no external CSS/JS, no extra services to run.
+
+**Open it in a browser:**
+
+```
+https://earlybird-production-e5b5.up.railway.app/dashboard/ui?key=<DASHBOARD_API_KEY>
+```
+
+The consolidated JSON behind the page is at `/dashboard/data?key=<DASHBOARD_API_KEY>`.
+
+**Authentication.** Both routes accept the key two ways:
+
+- the `x-dashboard-key` header (same as the existing JSON endpoints), or
+- a `?key=<DASHBOARD_API_KEY>` query parameter, for convenient browser access.
+
+> ⚠️ **Security note:** the query-param form is convenient but puts the key in
+> the URL. Do **not** share dashboard links containing the key in public
+> channels, tickets, or screenshots. The dashboard never displays or logs the
+> key, never exposes raw payloads, raw/hashed user identifiers, requester
+> emails, or webhook secrets. When `DASHBOARD_API_KEY` is unset the dashboard is
+> open (dev/demo only) — set a key before exposing it publicly.
+
+**What it shows:**
+
+- **Status cards** — total & critical incidents, alerts delivered, notification
+  failures, Freshdesk matches, agent wins/losses, pending/unmatched, win rate,
+  median & p90 lead time, active anomalies.
+- **Benchmark card** — the official win rule
+  (`agent_alert_timestamp < freshdesk_ticket_created_at`) plus the latest
+  outcome (WON / LOST / PENDING), lead time, Freshdesk ticket id, and incident id.
+- **Sections:** benchmark summary · recent incidents · active anomalies /
+  metric buckets · breakdown by business action · breakdown by dimension
+  (country, provider, platform, payment method) · audit highlights · source
+  integration status · production links.
+
+**Datadog/Sentry are not required** for the dashboard to render — it reads
+existing Earlybird database tables and shows friendly empty states ("No
+incidents in the last 30 days.", "Not observed yet", …) where data is absent.
+Metrics become richer as Datadog, Sentry, and product events are connected and
+flow through the pipeline.
+
+The existing JSON endpoints (`/dashboard/summary`, `/dashboard/metrics`,
+`/dashboard/audit`) are unchanged.
 
 ---
 
