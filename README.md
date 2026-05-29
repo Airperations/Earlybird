@@ -4,6 +4,8 @@
 
 An autonomous agent that monitors every error and anomaly on the Airtm platform, detects them before they become support tickets, and proves it with an immutable audit trail.
 
+_Built by **Angy Duarte** — [angy@airtm.io](mailto:angy@airtm.io)_
+
 ---
 
 ## 🏆 Success Metric
@@ -72,6 +74,55 @@ And returns this:
 ```
 
 Claude Haiku does not detect the incident — that is done by the scoring matrix. Claude only explains it in plain language so the team understands what happened without reading logs. It is only called for high-confidence incidents above the score threshold, keeping costs low.
+
+### What the Slack alert looks like
+
+When an incident clears the score threshold, Earlybird posts a rich [Block Kit](https://api.slack.com/block-kit) message to your channel — fully automatic, no manual step. It is built in `app/alerts/slack.py` and looks like this:
+
+```
+┌────────────────────────────────────────────────────────────┐  ← colored bar
+│ 🔴 EARLYBIRD — CRITICAL INCIDENT                             │     (red = critical)
+│ Withdrawal failures in LATAM                                 │
+├──────────────────────────────────────────────────────────── │
+│ Service:  payments-api      Endpoint:  /withdraw/confirm     │
+│ Impact:   12 users, 47 errors   Region:  MX, CO              │
+│ Score:    125 / critical    Owner:   payments               │
+│                                                              │
+│ Guardian Analysis:                                           │
+│   Users in Mexico and Colombia are receiving HTTP 502        │
+│   errors during withdrawal confirmation.                     │
+│                                                              │
+│ Suspected Root Cause:                                        │
+│   Payment provider timeout or recent payments-api deploy.    │
+│                                                              │
+│ Suggested Next Steps:                                        │
+│   1. Check recent deployments in payments-api                │
+│   2. Inspect payment provider latency                        │
+│   3. Review withdrawal confirmation logs                     │
+│                                                              │
+│ Support Message:                                             │
+│   Some users may experience failed withdrawals. Engineering  │
+│   is investigating.                                          │
+├──────────────────────────────────────────────────────────── │
+│ ⏱️ Agent Alert Timestamp: 2026-05-28T20:43:01Z               │
+│ 🆔 Incident: 3f9a1c2b   🔍 Fingerprint: a1b2c3d4e5f6...      │
+│ 📋 Freshdesk: Monitoring...                                  │
+└────────────────────────────────────────────────────────────┘
+```
+
+Everything in that message is generated automatically when the webhook fires — zero manual intervention:
+
+| Element | Source |
+|---------|--------|
+| **Colored bar** (red/orange/yellow/blue) | Severity from the scoring matrix |
+| **Guardian Analysis** | Claude Haiku, in real time |
+| **Suspected root cause** | Inferred by Claude from the error context |
+| **Suggested next steps** | Claude, specific to the incident type |
+| **Support message** | Claude — ready to copy and send to users |
+| **Agent Alert Timestamp** | The exact moment locked for the Freshdesk race |
+| **Freshdesk: Monitoring…** | Flips to `🏆 WON +3m 11s` (or `❌ LOST`) once a matching ticket is found |
+
+PII (emails, account numbers, secrets) is redacted before the text is sent to Claude or rendered to Slack (see `app/redaction.py`). If `SLACK_WEBHOOK_URL` is not configured, the alert is skipped gracefully and the incident is still recorded with its timestamp.
 
 ---
 
