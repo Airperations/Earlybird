@@ -16,6 +16,65 @@ The dashboard shows this in real-time. No manual counting.
 
 ---
 
+## How it works
+
+### Where does incident data come from?
+
+Earlybird does not connect to Sentry or Datadog — it works the other way around. When Sentry detects an error, it automatically sends an HTTP POST to Earlybird's webhook URL with all the context already included:
+
+```json
+{
+  "tags": [
+    ["country_code", "MX"],
+    ["environment", "production"],
+    ["http.status_code", "502"]
+  ],
+  "request": {
+    "url": "https://api.airtm.com/api/v1/withdraw/confirm"
+  },
+  "user": { "id": "user_001" }
+}
+```
+
+The country, endpoint, user, error type — all of it comes from Sentry automatically. Earlybird just needs to receive it, which only requires adding one webhook URL in Sentry's settings. No credentials, no API keys, no access to production systems needed.
+
+### What does Claude Haiku do exactly?
+
+Claude Haiku has one job: turn raw technical data into clear, human-readable summaries that engineers and support can act on immediately.
+
+It receives the processed incident:
+
+```json
+{
+  "endpoint": "/withdraw/confirm",
+  "http_status": 502,
+  "affected_users": 12,
+  "countries": ["MX", "CO"],
+  "exception_type": "GatewayTimeout"
+}
+```
+
+And returns this:
+
+```json
+{
+  "title": "Withdrawal failures in LATAM",
+  "summary": "Users in Mexico and Colombia are receiving HTTP 502 errors during withdrawal confirmation.",
+  "suspected_root_cause": "Payment provider timeout or recent deployment in payments-api.",
+  "recommended_next_steps": [
+    "Check recent deployments in payments-api",
+    "Inspect payment provider latency",
+    "Review withdrawal confirmation logs",
+    "Notify support proactively"
+  ],
+  "support_message": "Some users may experience failed withdrawal confirmations. Engineering is investigating."
+}
+```
+
+Claude Haiku does not detect the incident — that is done by the scoring matrix. Claude only explains it in plain language so the team understands what happened without reading logs. It is only called for high-confidence incidents above the score threshold, keeping costs low.
+
+---
+
 ## Architecture
 
 ```
