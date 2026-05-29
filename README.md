@@ -18,6 +18,24 @@ The dashboard shows this in real-time. No manual counting.
 
 ---
 
+## 🥇 Why this wins
+
+The challenge is decided on a single comparison: **agent alert timestamp vs. Freshdesk ticket timestamp.** Every design choice below exists to win that race honestly.
+
+1. **The agent alerts immediately — *before* LLM enrichment.** The pipeline is `score → minimal immediate alert → real delivered timestamp → LLM enrichment → thread follow-up`. The first Slack message carries everything a responder needs (id, fingerprint, score, severity, affected users, event count, first/last seen, endpoint/service/action, region/platform, status `enriching…`) and is sent with **zero LLM latency** in front of it. Claude's analysis arrives seconds later as a threaded reply. _Enforced by tests in `tests/test_alerting.py` and `tests/test_slack_retry.py`._
+
+2. **The official benchmark timestamp is set only after *real* notification delivery.** `agent_alert_timestamp` is assigned in exactly one place — `mark_incident_delivered()` — mirroring `notification_delivered_at`. A Slack failure (after retries) moves the incident to `notification_failed` and leaves the timestamp **NULL**. The agent can never claim a win it didn't deliver. _Enforced by `test_official_timestamp_set_only_after_delivery` and `test_failed_delivery_records_no_timestamp`._
+
+3. **Freshdesk webhooks are processed immediately.** `/freshdesk/webhook` persists the ticket **and runs the matcher inside the request** — the race is scored the instant a ticket is created, not on the next 60s poll. _Enforced by `test_webhook_immediate_save_and_match`._
+
+4. **Matching is a metadata / time / keyword / semantic hybrid — never LLM-only.** Confidence combines country-tag overlap, time proximity, bilingual financial-keyword overlap, and content-word ('semantic') overlap. A model hallucination alone can't fabricate or destroy a match. _See `app/freshdesk/matcher.py::calculate_match_confidence`._
+
+5. **Anomaly detection catches silent business degradation before users complain.** Z-score volume spikes, elevated failure rates, stuck/pending rates, and latency regressions trip an alert even when no single error looks severe — and critical money-flows alert on tiny samples. _See `app/incidents/anomaly.py`._
+
+6. **The judge audit endpoint proves wins transparently.** `GET /dashboard/audit` returns, per incident, the full lifecycle timeline, the benchmark timestamp, the matched ticket with signed delta, and the **immutable** audit-log trail — **including losses and failed notifications**. Nothing is hidden.
+
+---
+
 ## How it works
 
 ### Where does incident data come from?
@@ -77,7 +95,12 @@ Claude Haiku does not detect the incident — that is done by the scoring matrix
 
 ### What the Slack alert looks like
 
-When an incident clears the score threshold, Earlybird posts a rich [Block Kit](https://api.slack.com/block-kit) message to your channel — fully automatic, no manual step. It is built in `app/alerts/slack.py` and looks like this:
+Alerting is **two-phase**, and this ordering is the whole game:
+
+1. **Immediate minimal alert** (`send_immediate_alert`) — fired the instant the incident crosses threshold, with **no LLM call in front of it**. It shows status `enriching…` and carries id, fingerprint, score, severity, impact, region, endpoint/service/action, platform, and first/last-seen timestamps. Its **delivery** is what locks `agent_alert_timestamp`.
+2. **Enrichment follow-up** (`send_enrichment_followup`) — Claude's analysis, posted seconds later as a **thread reply** (with a bot token) or a follow-up message (with a webhook). If the LLM fails, the incident still counts as alerted.
+
+The enriched view (delivered as the thread reply) is built in `app/alerts/slack.py` and looks like this:
 
 ```
 ┌────────────────────────────────────────────────────────────┐  ← colored bar
@@ -129,26 +152,28 @@ PII (emails, account numbers, secrets) is redacted before the text is sent to Cl
 ## Architecture
 
 ```
-Sentry / Datadog / Product Events
+Webhook / Product Events / Metrics   (Sentry · Datadog · Airtm platform)
         ↓ (milliseconds)
 FastAPI Ingestion — immediate timestamp + HTTP 200
         ↓
 Redis + Celery Queue — durable async processing
         ↓
-Event Normalizer → Fingerprinting → Deduplication
+Normalizer → Fingerprinting → Deduplication / Recurrence
         ↓
-Business Criticality Matrix (6 scoring factors)
-        ↓  (if score ≥ threshold)
-Claude Haiku LLM — incident summary in <2s
+Scoring + Anomaly Detection   (criticality matrix · z-score / failure / pending / latency)
+        ↓  (if score ≥ threshold  OR  anomaly  OR  critical money-flow)
+Immediate Alert Delivery  ──►  AGENT ALERT TIMESTAMP LOCKED ON DELIVERY
+        ↓                       (retry + backoff; failure ⇒ no timestamp)
+LLM Enrichment            ──►  posted as a Slack thread reply (after delivery)
         ↓
-Slack Alert ← AGENT ALERT TIMESTAMP LOCKED HERE
+Freshdesk Matching        (immediate webhook ingest · hybrid confidence)
         ↓
-PostgreSQL Audit Log (immutable evidence)
-        ↓
-Freshdesk Comparator (polling + real-time webhook)
-        ↓
-Victory Dashboard — Agent Won / Lost / Lead Time
+Judge Audit Dashboard     — Won / Lost / Lead Time + immutable evidence trail
 ```
+
+The benchmark timestamp is locked at **Immediate Alert Delivery**, two steps
+*before* LLM enrichment — so the agent's clock starts as early as physically
+possible while the AI write-up still arrives moments later in-thread.
 
 ---
 
@@ -170,6 +195,24 @@ docker-compose up --build
 
 # 4. Run the demo simulation
 python simulate_demo.py
+```
+
+### Running the tests
+
+```bash
+pip install -r requirements.txt
+pytest -q          # full suite (fast, in-memory SQLite — no Postgres/Redis needed)
+```
+
+The suite proves the winning invariants directly: alert-before-LLM, timestamp-only-after-delivery, Slack retry, anomaly detection, hybrid match confidence + win/loss logic, immediate Freshdesk ingest, state-machine transitions, fingerprint recurrence, and PII redaction.
+
+### Running the app locally (without Docker)
+
+```bash
+alembic upgrade head                                              # migrate (Postgres)
+uvicorn app.main:app --reload                                     # API
+celery -A app.celery_app worker --loglevel=info -Q events,freshdesk   # worker
+celery -A app.celery_app beat --loglevel=info                    # scheduler
 ```
 
 ---
@@ -265,13 +308,13 @@ Dashboard: https://earlybird-production.up.railway.app/dashboard/summary
 Run `python simulate_demo.py` to see the full pipeline in action:
 
 1. A Sentry webhook fires (withdrawal error, Mexico, HTTP 502)
-2. Agent captures timestamp immediately
+2. Agent captures the receive timestamp immediately and returns HTTP 200
 3. Celery worker normalizes and scores the event (score: 125 → Critical)
-4. Claude Haiku generates an incident summary
-5. Slack alert sent with `agent_alert_timestamp` locked
-6. A Freshdesk ticket arrives 3 minutes later
+4. **Minimal Slack alert is sent first (no LLM)** — `agent_alert_timestamp` locks on delivery
+5. Claude Haiku enriches the incident; the analysis is posted as a thread reply
+6. A Freshdesk ticket arrives 3 minutes later → `/freshdesk/webhook` matches it instantly
 7. Matcher records: **Agent Won (+180s lead time)**
-8. Dashboard shows win rate
+8. Dashboard `/dashboard/summary` and `/dashboard/audit` show the proof
 
 ---
 
@@ -290,6 +333,21 @@ Each incident is scored across 6 dimensions:
 
 **Thresholds:** `observe < 40 < low < 60 < medium < 80 < high < 100 < critical`
 
+An incident alerts when its score crosses `INCIDENT_ALERT_THRESHOLD` (default 60), or `CRITICAL_BUSINESS_ACTION_THRESHOLD` (default 40) on a money-flow endpoint, **or** when an anomaly trips — so a low-volume but high-impact financial failure still beats support.
+
+### Anomaly detection (beyond the matrix)
+
+Some degradations never throw a loud error. `app/incidents/anomaly.py` adds pure, tested detectors that run on product-event metric payloads:
+
+| Detector | Trips when | Tuning knob |
+|----------|-----------|-------------|
+| Volume spike | z-score ≥ threshold vs baseline series | `ANOMALY_Z_SCORE_THRESHOLD`, `ANOMALY_MIN_SAMPLE_SIZE` |
+| Failure rate | failures/total ≥ threshold | `ANOMALY_FAILURE_RATE_THRESHOLD` |
+| Pending/stuck rate | pending/total ≥ threshold | `ANOMALY_PENDING_RATE_THRESHOLD` |
+| Latency regression | p95 ≥ factor × baseline p95 | `ANOMALY_LATENCY_REGRESSION_FACTOR` |
+
+Critical money-flows use `ANOMALY_CRITICAL_MIN_SAMPLE_SIZE` so even a handful of failed withdrawals is enough to fire.
+
 ---
 
 ## Key Design Decisions
@@ -297,8 +355,14 @@ Each incident is scored across 6 dimensions:
 **Why Redis + Celery instead of FastAPI BackgroundTasks?**
 For a 30-day production trial, task durability matters. If the server restarts, BackgroundTasks are lost. Celery with `acks_late=True` re-delivers in-flight events after a worker crash. (Events that fail all retries are logged as dropped — wiring a dead-letter queue is the next hardening step.)
 
+**Why alert before enrichment?**
+The benchmark is won or lost on the alert timestamp. Generating an LLM summary *before* the first alert would add seconds of avoidable latency to the exact number the judges measure. So the agent sends a useful minimal alert first, locks the timestamp on delivery, and enriches afterward in-thread. The LLM is never on the critical path.
+
+**Why is the timestamp set only on delivery?**
+A win must be real. `agent_alert_timestamp` is written in one place only — on confirmed Slack delivery — so a dropped notification is recorded as `notification_failed` with no timestamp, never as a silent win. Delivery is retried with backoff first (`SLACK_MAX_RETRIES`).
+
 **Why Claude Haiku?**
-Fast (< 2s), cheap, and produces JSON reliably. The LLM only runs on high-confidence incidents — not on every error — so costs stay low.
+Fast, cheap, and produces JSON reliably. The LLM only runs on high-confidence incidents — not on every error, and never before the first alert — so costs and latency stay low.
 
 **Why the Freshdesk webhook endpoint?**
 Polling every 60s creates a worst-case 60s delay in registering results. The `/freshdesk/webhook` endpoint enables a real-time trigger so the comparison is recorded the instant a ticket is created.
@@ -349,14 +413,17 @@ earlybird/
 │   │   └── base.py              # Sentry/Datadog/Product normalizer
 │   ├── incidents/
 │   │   ├── scoring.py           # Business criticality matrix
-│   │   └── service.py           # Incident state machine
+│   │   ├── anomaly.py           # Z-score / failure / pending / latency detectors
+│   │   ├── alerting.py          # Fast-path orchestrator (deliver → enrich)
+│   │   └── service.py           # Incident state machine + lifecycle writes
 │   ├── llm/
 │   │   └── analyst.py           # Claude Haiku integration
 │   ├── alerts/
-│   │   └── slack.py             # Rich Slack Block Kit alerts
+│   │   └── slack.py             # Two-phase Block Kit alerts (immediate + thread)
 │   ├── freshdesk/
 │   │   ├── client.py            # Freshdesk API client
-│   │   ├── matcher.py           # Race result calculator
+│   │   ├── matcher.py           # Hybrid match confidence + win/loss logic
+│   │   ├── ingest.py            # Immediate webhook ticket save + match
 │   │   └── routes.py            # Freshdesk API endpoints
 │   ├── dashboard/
 │   │   └── routes.py            # Metrics API
@@ -384,8 +451,9 @@ earlybird/
 | POST | `/events/product` | Custom product events |
 | POST | `/freshdesk/webhook` | Real-time Freshdesk ticket notification |
 | POST | `/freshdesk/sync` | Manual sync trigger |
-| GET | `/dashboard/summary` | Win rate and lead time metrics |
-| GET | `/dashboard/incidents` | Full incident comparison log |
+| GET | `/dashboard/summary` | Win rate and lead time metrics (incl. failed notifications) |
+| GET | `/dashboard/incidents` | Full incident comparison log (with lifecycle timestamps) |
+| GET | `/dashboard/audit` | **Judge audit** — per-incident lifecycle, deltas & immutable trail |
 | GET | `/dashboard/win-rate` | Single win rate metric |
 | GET | `/health` | Health check |
 | GET | `/docs` | Interactive API docs |

@@ -11,6 +11,7 @@ import logging
 from app.config import settings
 from app.database import get_db
 from app.webhooks.security import require_shared_secret, parse_json_or_400, enforce_replay_protection
+from app.freshdesk.ingest import ingest_ticket
 from app.workers.freshdesk_sync import sync_freshdesk_tickets
 
 router = APIRouter()
@@ -18,24 +19,35 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("/webhook")
-async def freshdesk_webhook(request: Request, background_tasks: BackgroundTasks):
+async def freshdesk_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Real-time Freshdesk webhook on ticket creation.
     Configure in Freshdesk: Admin > Automations > Webhooks > On Ticket Create,
     adding a custom header `x-webhook-token: <FRESHDESK_WEBHOOK_SECRET>`.
-    This gives us instant comparison instead of waiting for polling.
+
+    The ticket is persisted AND matched immediately, inside this request — no
+    waiting for the 60s poll — so the race outcome is recorded the instant a
+    support ticket is created. A background full sync is still scheduled to pick
+    up any fields/relations the webhook body omits.
     """
     received_at = datetime.now(timezone.utc)
     require_shared_secret(request, settings.FRESHDESK_WEBHOOK_SECRET, "freshdesk")
     await enforce_replay_protection(request, "freshdesk")
     payload = await parse_json_or_400(request)
 
-    logger.info(f"[FRESHDESK WEBHOOK] Ticket received at {received_at.isoformat()}: {payload.get('id')}")
+    logger.info(f"[FRESHDESK WEBHOOK] Ticket received at {received_at.isoformat()}")
 
-    # Run sync immediately (not waiting for Celery Beat)
+    # Immediate save + match (get_db commits on success).
+    result = await ingest_ticket(db, payload)
+
+    # Backfill via full sync for any data the webhook didn't carry.
     background_tasks.add_task(sync_freshdesk_tickets)
 
-    return {"status": "accepted", "received_at": received_at.isoformat()}
+    return {"status": "accepted", "received_at": received_at.isoformat(), **result}
 
 
 @router.post("/sync")

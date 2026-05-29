@@ -72,7 +72,9 @@ class Incident(Base):
     fingerprint = Column(String(255), nullable=False, unique=True, index=True)
     title = Column(String(500), nullable=True)
 
-    # State machine: new → observing → alerted → matched → resolved | ignored
+    # State machine:
+    #   new → observing → detected → alerted → enriched → matched_to_freshdesk → resolved
+    #   (with notification_failed / ignored / false_positive branches)
     status = Column(String(50), nullable=False, default="new")
     severity = Column(String(20), nullable=True)       # critical | high | medium | low
     score = Column(Integer, default=0)
@@ -85,10 +87,26 @@ class Incident(Base):
     countries = Column(JSONB, default=list)
 
     # === BOUNTY KEY FIELD ===
-    # This timestamp is compared against Freshdesk ticket created_at
+    # The OFFICIAL benchmark timestamp compared against Freshdesk ticket created_at.
+    # CRITICAL INVARIANT: this is set ONLY after Slack confirms real delivery
+    # (== notification_delivered_at). A failed/never-attempted notification leaves
+    # it NULL, so the agent can never claim a win it did not actually deliver.
     agent_alert_timestamp = Column(DateTime(timezone=True), nullable=True)
 
+    # ── Lifecycle audit timestamps (the fast-path proof) ───────────────────
+    # detected:   incident crossed the alert threshold (alert decision made)
+    # attempted:  first Slack delivery attempt began
+    # delivered:  Slack confirmed delivery → mirrors agent_alert_timestamp
+    # enriched:   LLM summary produced and posted as a follow-up (after delivery)
+    detected_at = Column(DateTime(timezone=True), nullable=True)
+    notification_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    notification_delivered_at = Column(DateTime(timezone=True), nullable=True)
+    enriched_at = Column(DateTime(timezone=True), nullable=True)
+    notification_status = Column(String(20), nullable=False, default="pending")  # pending|delivered|failed
+    notification_attempts = Column(Integer, default=0)
+
     slack_message_id = Column(String(255), nullable=True)
+    slack_thread_ts = Column(String(64), nullable=True)   # parent ts for enrichment thread reply
     llm_summary = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)

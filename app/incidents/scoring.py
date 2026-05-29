@@ -126,6 +126,10 @@ class ScoringResult:
     severity: str
     breakdown: dict
     suggested_owner: Optional[str]
+    # True when the incident hit a business-critical endpoint (e.g. /withdraw).
+    # Such incidents alert at a lower threshold — a low-volume but high-impact
+    # financial failure must still beat support.
+    is_critical_path: bool = False
 
     def should_alert(self, threshold: int = 60) -> bool:
         return self.total_score >= threshold
@@ -180,6 +184,7 @@ def calculate_criticality(
         severity=severity,
         breakdown=breakdown,
         suggested_owner=owner,
+        is_critical_path=path_score > 0,
     )
 
 
