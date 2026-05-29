@@ -164,10 +164,21 @@ DEDUP_WINDOW_MINUTES=30
 
 ### Step 5 — Configure the 3 services
 
-**API service** → Settings → Start Command:
-```bash
-alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
-```
+**API service** → Settings:
+
+- **Pre-Deploy Command** (runs migrations once, before the app starts — keeps them
+  out of the healthcheck window so a transactional migration can't be killed
+  mid-run and leave Postgres locks):
+  ```bash
+  alembic upgrade head
+  ```
+- **Start Command** (only serves traffic):
+  ```bash
+  uvicorn app.main:app --host 0.0.0.0 --port $PORT
+  ```
+
+> Set the Pre-Deploy Command on the **API service only** — not on worker/beat —
+> so the migration runs exactly once per deploy and never concurrently.
 
 **Worker service** (new GitHub deploy from same repo) → Start Command:
 ```bash
