@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import FreshdeskTicket
 from app.freshdesk.matcher import match_incidents_to_freshdesk, normalize_tags
+from app.redaction import hash_identifier, redact_payload
 
 logger = logging.getLogger(__name__)
 
@@ -58,16 +59,19 @@ async def ingest_ticket(db: AsyncSession, payload: dict) -> dict:
     ticket_id = str(ticket_id)
     created_at = _parse_time(ticket.get("created_at"))
 
+    raw_email = (ticket.get("requester") or {}).get("email") if isinstance(ticket.get("requester"), dict) else ticket.get("requester_email")
+
     existing = await db.get(FreshdeskTicket, ticket_id)
     if existing is None:
         db.add(FreshdeskTicket(
             id=ticket_id,
             subject=ticket.get("subject"),
             description=ticket.get("description_text") or ticket.get("description"),
-            requester_email=(ticket.get("requester") or {}).get("email") if isinstance(ticket.get("requester"), dict) else ticket.get("requester_email"),
+            # Store a salted hash of the requester, never the raw email.
+            requester_email=hash_identifier(raw_email),
             tags=normalize_tags(ticket.get("tags")),
             created_at=created_at,
-            raw_payload=ticket,
+            raw_payload=redact_payload(ticket),
         ))
         await db.flush()
         logger.info(f"[FRESHDESK INGEST] Saved ticket {ticket_id} immediately from webhook")

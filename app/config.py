@@ -25,8 +25,19 @@ class Settings(BaseSettings):
     SLACK_ALERT_CHANNEL: str = "#earlybird-alerts"
 
     # Optional fallback notification channels (used only if Slack delivery fails).
+    # Delivery order is Slack → PagerDuty → email; the FIRST channel that confirms
+    # delivery locks the official benchmark timestamp.
     ALERT_FALLBACK_EMAIL: Optional[str] = None
     PAGERDUTY_ROUTING_KEY: Optional[str] = None
+    PAGERDUTY_EVENTS_URL: str = "https://events.pagerduty.com/v2/enqueue"
+    PAGERDUTY_TIMEOUT_SECONDS: float = 5.0
+    # SMTP for the email fallback (all required for email to be attempted).
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    ALERT_EMAIL_FROM: Optional[str] = None
+    SMTP_TIMEOUT_SECONDS: float = 5.0
 
     # Dashboard auth — when set, /dashboard/* requires header `x-dashboard-key`.
     DASHBOARD_API_KEY: Optional[str] = None
@@ -75,6 +86,15 @@ class Settings(BaseSettings):
     ANOMALY_FAILURE_RATE_THRESHOLD: float = 0.30   # 30% failure rate triggers
     ANOMALY_PENDING_RATE_THRESHOLD: float = 0.40
     ANOMALY_LATENCY_REGRESSION_FACTOR: float = 2.0  # p95 doubling is a regression
+
+    # ── Rolling-baseline anomaly detection (self-built MetricBucket series) ──
+    # The current window is the most recent N minutes; the baseline is the
+    # preceding window. A success-rate that drops by this much vs its own baseline
+    # (e.g. 0.97 → 0.71) trips an alert, per country/provider/platform/method.
+    ANOMALY_CURRENT_WINDOW_MINUTES: int = 5
+    ANOMALY_SUCCESS_RATE_DROP: float = 0.20
+    ANOMALY_BASELINE_MIN_TOTAL: int = 20          # min baseline events to trust a rate
+    ANOMALY_BASELINE_CRITICAL_MIN_TOTAL: int = 5  # money-flows trust smaller samples
 
     # ── Freshdesk matching ─────────────────────────────────────────────────
     FRESHDESK_MATCH_WINDOW_HOURS: int = 24

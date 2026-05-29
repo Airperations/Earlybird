@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean, Text,
-    DateTime, ForeignKey, JSON
+    DateTime, ForeignKey, JSON, Index, text
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
@@ -50,7 +50,7 @@ class NormalizedEvent(Base):
     http_status = Column(Integer, nullable=True)
     exception_type = Column(String(255), nullable=True)
     message = Column(Text, nullable=True)
-    user_id = Column(String(255), nullable=True)
+    user_id = Column(String(255), nullable=True)   # SALTED HASH of the user id, never raw (see app.redaction)
     country = Column(String(10), nullable=True)
     platform = Column(String(50), nullable=True)
     release = Column(String(100), nullable=True)
@@ -68,9 +68,40 @@ class Incident(Base):
     """
     __tablename__ = "incidents"
 
+    # Fingerprint is NOT globally unique: a resolved/false_positive incident that
+    # recurs becomes a NEW row (its own benchmark race). A partial unique index
+    # (see __table_args__) instead allows only ONE *open* incident per fingerprint,
+    # so live duplicates can't form while history stays clean per recurrence.
+    __table_args__ = (
+        Index(
+            "uq_open_incident_fingerprint",
+            "fingerprint",
+            unique=True,
+            postgresql_where=text("status NOT IN ('resolved', 'false_positive')"),
+            sqlite_where=text("status NOT IN ('resolved', 'false_positive')"),
+        ),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    fingerprint = Column(String(255), nullable=False, unique=True, index=True)
+    # Non-unique index (lookups by fingerprint); open-uniqueness handled above.
+    fingerprint = Column(String(255), nullable=False, index=True)
     title = Column(String(500), nullable=True)
+
+    # ── Structured business metadata ────────────────────────────────────────
+    # Populated from the normalized event so the incident can answer "what / where
+    # / who" WITHOUT reading the LLM summary, and so the matcher can use these as
+    # first-class signals.
+    service = Column(String(100), nullable=True)
+    endpoint = Column(String(255), nullable=True)
+    route = Column(String(255), nullable=True)              # normalized request path
+    business_action = Column(String(100), nullable=True, index=True)  # e.g. withdrawal_failed
+    http_status = Column(Integer, nullable=True)
+    exception_type = Column(String(255), nullable=True)
+    primary_country = Column(String(10), nullable=True)
+    provider = Column(String(100), nullable=True)           # e.g. stripe
+    platform = Column(String(50), nullable=True)            # e.g. ios / android / web
+    payment_method = Column(String(50), nullable=True)      # e.g. card / crypto
+    normalized_keywords = Column(JSONB, default=list)       # searchable vocabulary footprint
 
     # State machine:
     #   new → observing → detected → alerted → enriched → matched_to_freshdesk → resolved
@@ -82,7 +113,9 @@ class Incident(Base):
     first_seen_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     last_seen_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     affected_users_count = Column(Integer, default=0)
-    affected_user_ids = Column(JSONB, default=list)   # distinct user ids seen for this incident
+    # SALTED HASHES of distinct user ids — never raw ids. Keeps the affected-users
+    # count accurate and overlap detectable while storing zero PII. See app.redaction.
+    affected_user_hashes = Column(JSONB, default=list)
     event_count = Column(Integer, default=1)
     countries = Column(JSONB, default=list)
 
@@ -107,6 +140,8 @@ class Incident(Base):
 
     slack_message_id = Column(String(255), nullable=True)
     slack_thread_ts = Column(String(64), nullable=True)   # parent ts for enrichment thread reply
+    # Which channel actually delivered the benchmark alert: slack | pagerduty | email.
+    notification_channel = Column(String(20), nullable=True)
     llm_summary = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
@@ -135,7 +170,7 @@ class FreshdeskTicket(Base):
     id = Column(String(50), primary_key=True)           # Freshdesk ticket ID
     subject = Column(Text, nullable=True)
     description = Column(Text, nullable=True)
-    requester_email = Column(String(255), nullable=True)
+    requester_email = Column(String(255), nullable=True)  # stores a SALTED HASH, never the raw email
     tags = Column(JSONB, default=list)
     created_at = Column(DateTime(timezone=True), nullable=False)
     raw_payload = Column(JSONB, nullable=True)
@@ -165,6 +200,13 @@ class IncidentFreshdeskMatch(Base):
     # agent_won | agent_lost | tie
     outcome = Column(String(20), nullable=False)
     confidence = Column(Float, nullable=True)
+    # Structured, auditable explanation of WHY this ticket matched this incident.
+    #   matched_by:    ["business_action", "country", "provider", "time_window", "keyword_match"]
+    #   match_reasons: {"business_action": "withdrawal_failed", "country": "MX",
+    #                   "keyword_overlap": ["retiro","falló"], "keyword_language": "es",
+    #                   "time_delta_seconds": 240, ...}
+    matched_by = Column(JSONB, default=list)
+    match_reasons = Column(JSONB, default=dict)
     evidence = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
@@ -182,6 +224,43 @@ class AuditLog(Base):
     event = Column(String(255), nullable=False)
     timestamp = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     details = Column(JSONB, nullable=True)
+
+
+class MetricBucket(Base):
+    """
+    Per-minute, per-dimension business metrics the agent builds for ITSELF from
+    the event stream — the substrate for rolling-baseline anomaly detection.
+
+    One row = one (minute, business_action, dimension, dimension_value) cell, e.g.
+    (12:03, "withdrawal", "country", "MX"). The agent compares a recent window to
+    the preceding baseline window per dimension, so it can catch
+    "withdrawal_success_rate in MX dropped 97%→71%" with no producer-side metrics.
+    """
+    __tablename__ = "metric_buckets"
+    __table_args__ = (
+        Index(
+            "uq_metric_bucket_cell",
+            "bucket_start", "business_action", "dimension", "dimension_value",
+            unique=True,
+        ),
+        Index("ix_metric_buckets_lookup", "business_action", "dimension", "dimension_value", "bucket_start"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_start = Column(DateTime(timezone=True), nullable=False)   # truncated to the minute
+    business_action = Column(String(100), nullable=False)           # base action, e.g. "withdrawal"
+    dimension = Column(String(30), nullable=False)                  # global|country|provider|platform|payment_method
+    dimension_value = Column(String(100), nullable=False)           # ALL|MX|stripe|ios|card|...
+
+    total_count = Column(Integer, nullable=False, default=0)
+    success_count = Column(Integer, nullable=False, default=0)
+    failure_count = Column(Integer, nullable=False, default=0)
+    pending_count = Column(Integer, nullable=False, default=0)
+    latency_count = Column(Integer, nullable=False, default=0)      # events that carried a latency sample
+    latency_sum_ms = Column(Float, nullable=False, default=0.0)
+    latency_max_ms = Column(Float, nullable=False, default=0.0)
+
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class DeadLetterEvent(Base):

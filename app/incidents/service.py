@@ -8,15 +8,23 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from typing import Optional
 import logging
 
 from app.models import Incident, NormalizedEvent, IncidentEvent, RawEvent, AuditLog
 from app.normalizers.base import NormalizedEventSchema
 from app.incidents.scoring import ScoringResult
+from app.redaction import hash_identifier
+from app.taxonomy import build_normalized_keywords
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# An incident is "open" (and therefore reusable / blocking) in every status
+# except these terminal ones. Mirrors the partial unique index in models.py and
+# the official recurrence rule: a recurrence of a CLOSED fingerprint is a NEW race.
+CLOSED_STATUSES = ("resolved", "false_positive")
 
 # Incident state machine valid transitions.
 #
@@ -83,76 +91,121 @@ async def find_or_create_incident(
     db: AsyncSession,
     normalized: NormalizedEventSchema,
 ) -> Incident:
-    """Find an existing open incident with the same fingerprint or create a new one."""
-    dedup_window = datetime.now(timezone.utc) - timedelta(
-        minutes=settings.DEDUP_WINDOW_MINUTES
-    )
+    """
+    Resolve the incident for an event under the official recurrence rule:
 
-    # Active incident within the dedup window → ordinary update (deduplication).
-    result = await db.execute(
+        same fingerprint + OPEN incident      → reuse it (ordinary dedup)
+        same fingerprint + resolved/false_pos → create a NEW incident row
+
+    Each recurrence of a CLOSED fingerprint is therefore its own benchmark race
+    against Freshdesk — clean incident_id, first_seen, alert timestamp, and match.
+    The partial unique index guarantees at most one open incident per fingerprint.
+    """
+    # 1) Reuse the single OPEN incident for this fingerprint, if any.
+    open_incident = (await db.execute(
         select(Incident)
         .where(Incident.fingerprint == normalized.fingerprint)
-        .where(Incident.status.not_in(["resolved", "false_positive"]))
-        .where(Incident.last_seen_at >= dedup_window)
-    )
-    incident = result.scalar_one_or_none()
+        .where(Incident.status.not_in(CLOSED_STATUSES))
+        .order_by(Incident.first_seen_at.desc())
+    )).scalars().first()
 
-    if incident:
-        _absorb_event(incident, normalized)
-        logger.info(f"[INCIDENT] Updated existing incident {incident.id} (count={incident.event_count})")
-        return incident
+    if open_incident:
+        _absorb_event(open_incident, normalized)
+        logger.info(f"[INCIDENT] Updated open incident {open_incident.id} (count={open_incident.event_count})")
+        return open_incident
 
-    # No active incident in-window. Because `fingerprint` is globally unique, a
-    # row may still exist that is resolved, a false positive, or simply went quiet
-    # past the dedup window. That is a RECURRENCE — reopen and re-arm it rather
-    # than (illegally) inserting a duplicate fingerprint.
-    existing = await db.execute(
-        select(Incident).where(Incident.fingerprint == normalized.fingerprint)
-    )
-    incident = existing.scalar_one_or_none()
-    if incident:
-        previous_status = incident.status
-        _absorb_event(incident, normalized)
-        # Reset the race fields so the recurrence is alerted (and raced) afresh.
-        if previous_status in ("resolved", "false_positive", "matched_to_freshdesk",
-                               "alerted", "enriched", "notification_failed"):
-            incident.status = "new"
-            incident.agent_alert_timestamp = None
-            incident.notification_status = "pending"
-            incident.notification_attempted_at = None
-            incident.notification_delivered_at = None
-            incident.detected_at = None
-            incident.enriched_at = None
-        await _log_audit(db, incident.id, "incident_recurred", {
-            "fingerprint": normalized.fingerprint,
-            "previous_status": previous_status,
-        })
-        logger.info(f"[INCIDENT] ♻️ Recurrence — reopened incident {incident.id} (was {previous_status})")
-        return incident
+    # 2) No open incident. If a CLOSED one exists, this is a recurrence → new row.
+    prior = (await db.execute(
+        select(Incident)
+        .where(Incident.fingerprint == normalized.fingerprint)
+        .order_by(Incident.first_seen_at.desc())
+    )).scalars().first()
+    is_recurrence = prior is not None
 
-    # Genuinely new fingerprint → create.
+    now = datetime.now(timezone.utc)
+    user_hash = hash_identifier(normalized.user_id)
     incident = Incident(
         id=uuid.uuid4(),
         fingerprint=normalized.fingerprint,
         status="new",
-        first_seen_at=datetime.now(timezone.utc),
-        last_seen_at=datetime.now(timezone.utc),
+        first_seen_at=now,
+        last_seen_at=now,
         event_count=1,
-        affected_users_count=1 if normalized.user_id else 0,
-        affected_user_ids=[normalized.user_id] if normalized.user_id else [],
+        affected_users_count=1 if user_hash else 0,
+        affected_user_hashes=[user_hash] if user_hash else [],
         countries=[normalized.country] if normalized.country else [],
+        **_incident_metadata(normalized),
     )
-    db.add(incident)
-    await db.flush()
-    logger.info(f"[INCIDENT] Created new incident {incident.id} for fingerprint {normalized.fingerprint}")
 
-    await _log_audit(db, incident.id, "incident_created", {"fingerprint": normalized.fingerprint})
+    # The partial unique index can reject this insert if a concurrent worker just
+    # created the open incident for the same fingerprint. Guard with a savepoint
+    # and fall back to reusing that incident — no IntegrityError ever surfaces.
+    try:
+        async with db.begin_nested():
+            db.add(incident)
+            await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raced = (await db.execute(
+            select(Incident)
+            .where(Incident.fingerprint == normalized.fingerprint)
+            .where(Incident.status.not_in(CLOSED_STATUSES))
+            .order_by(Incident.first_seen_at.desc())
+        )).scalars().first()
+        if raced:
+            _absorb_event(raced, normalized)
+            logger.info(f"[INCIDENT] Lost open-incident race for {normalized.fingerprint}; reusing {raced.id}")
+            return raced
+        raise
+
+    if is_recurrence:
+        await _log_audit(db, incident.id, "incident_recurred", {
+            "fingerprint": normalized.fingerprint,
+            "previous_incident_id": str(prior.id),
+            "previous_status": prior.status,
+        })
+        logger.info(
+            f"[INCIDENT] ♻️ Recurrence — NEW incident {incident.id} for fingerprint "
+            f"{normalized.fingerprint} (prior {prior.id} was {prior.status})"
+        )
+    else:
+        logger.info(f"[INCIDENT] Created new incident {incident.id} for fingerprint {normalized.fingerprint}")
+
+    await _log_audit(db, incident.id, "incident_created", {
+        "fingerprint": normalized.fingerprint,
+        "recurrence": is_recurrence,
+        "business_action": normalized.business_action,
+    })
 
     return incident
 
 
+def _incident_metadata(normalized: NormalizedEventSchema) -> dict:
+    """Structured business metadata copied onto a new incident from its first event."""
+    return dict(
+        service=normalized.service,
+        endpoint=normalized.endpoint,
+        route=normalized.endpoint,
+        business_action=normalized.business_action,
+        http_status=normalized.http_status,
+        exception_type=normalized.exception_type,
+        primary_country=normalized.country,
+        provider=normalized.provider,
+        platform=normalized.platform,
+        payment_method=normalized.payment_method,
+        normalized_keywords=build_normalized_keywords(
+            business_action=normalized.business_action,
+            provider=normalized.provider,
+            payment_method=normalized.payment_method,
+            country=normalized.country,
+            exception_type=normalized.exception_type,
+            endpoint=normalized.endpoint,
+        ),
+    )
+
+
 def _absorb_event(incident: Incident, normalized: NormalizedEventSchema) -> None:
-    """Fold one more event into an existing incident: count, recency, countries, users."""
+    """Fold one more event into an existing incident: count, recency, countries, users, metadata."""
     incident.event_count += 1
     incident.last_seen_at = datetime.now(timezone.utc)
 
@@ -161,13 +214,33 @@ def _absorb_event(incident: Incident, normalized: NormalizedEventSchema) -> None
         countries.append(normalized.country)
         incident.countries = countries
 
-    # Track distinct affected users so the "affected_users" scoring tier is real.
-    if normalized.user_id:
-        users = list(incident.affected_user_ids or [])
-        if normalized.user_id not in users:
-            users.append(normalized.user_id)
-            incident.affected_user_ids = users
+    # Track distinct affected users by SALTED HASH — never the raw id.
+    user_hash = hash_identifier(normalized.user_id)
+    if user_hash:
+        users = list(incident.affected_user_hashes or [])
+        if user_hash not in users:
+            users.append(user_hash)
+            incident.affected_user_hashes = users
             incident.affected_users_count = len(users)
+
+    # Backfill structured metadata that the first event didn't carry (e.g. a later
+    # event names the provider / payment method), without overwriting known values.
+    for field in ("service", "endpoint", "business_action", "http_status",
+                  "exception_type", "provider", "platform", "payment_method"):
+        if getattr(incident, field, None) in (None, "") and getattr(normalized, field, None):
+            setattr(incident, field, getattr(normalized, field))
+    if not incident.primary_country and normalized.country:
+        incident.primary_country = normalized.country
+    if not incident.route and normalized.endpoint:
+        incident.route = normalized.endpoint
+    incident.normalized_keywords = build_normalized_keywords(
+        business_action=incident.business_action,
+        provider=incident.provider,
+        payment_method=incident.payment_method,
+        country=incident.primary_country,
+        exception_type=incident.exception_type,
+        endpoint=incident.endpoint,
+    )
 
     incident.updated_at = datetime.now(timezone.utc)
 
@@ -190,7 +263,7 @@ async def save_normalized_event(
         http_status=normalized.http_status,
         exception_type=normalized.exception_type,
         message=normalized.message,
-        user_id=normalized.user_id,
+        user_id=hash_identifier(normalized.user_id),   # store the salted hash, never the raw id
         country=normalized.country,
         platform=normalized.platform,
         release=normalized.release,
@@ -239,6 +312,8 @@ async def mark_incident_delivered(
     thread_ts: Optional[str],
     delivered_at: datetime,
     attempts: int,
+    channel: str = "slack",
+    channel_log: Optional[list] = None,
 ):
     """
     Record a CONFIRMED first-alert delivery — the moment that sets the official
@@ -246,26 +321,32 @@ async def mark_incident_delivered(
 
     CRITICAL INVARIANT: agent_alert_timestamp is assigned here and ONLY here,
     mirroring notification_delivered_at. It is therefore impossible for the agent
-    to claim a win without an actual delivered notification. No LLM output is
-    required at this point — enrichment happens afterward.
+    to claim a win without an actual delivered notification. The timestamp is the
+    delivery time of the FIRST channel that succeeded (Slack → PagerDuty → email).
+    No LLM output is required at this point — enrichment happens afterward.
     """
     incident.notification_attempted_at = incident.notification_attempted_at or delivered_at
     incident.notification_delivered_at = delivered_at
     incident.agent_alert_timestamp = delivered_at          # ← the bounty field
     incident.notification_status = "delivered"
     incident.notification_attempts = attempts
-    incident.slack_message_id = slack_message_id
-    incident.slack_thread_ts = thread_ts
+    incident.notification_channel = channel
+    # Only Slack returns a thread/message ts; keep them channel-appropriate.
+    if channel == "slack":
+        incident.slack_message_id = slack_message_id
+        incident.slack_thread_ts = thread_ts
     incident.updated_at = datetime.now(timezone.utc)
 
     await transition_incident(db, incident, "alerted", {
         "agent_alert_timestamp": delivered_at.isoformat(),
-        "slack_delivered": True,
+        "delivered": True,
+        "channel": channel,
         "attempts": attempts,
+        "channel_log": channel_log or [],
     })
 
     logger.info(
-        f"[INCIDENT] 🚨 Alert DELIVERED for {incident.id} at {delivered_at.isoformat()} "
+        f"[INCIDENT] 🚨 Alert DELIVERED for {incident.id} via {channel} at {delivered_at.isoformat()} "
         f"(score={incident.score}, severity={incident.severity}, attempts={attempts})"
     )
 
@@ -276,10 +357,12 @@ async def mark_notification_failed(
     attempted_at: datetime,
     attempts: int,
     error: Optional[str] = None,
+    channel_log: Optional[list] = None,
 ):
     """
-    Record that delivery failed after all retries. The benchmark timestamp stays
-    NULL — a failed alert is NEVER counted as a win, and the failure is auditable.
+    Record that delivery failed on EVERY channel after all retries. The benchmark
+    timestamp stays NULL — a failed alert is NEVER counted as a win, and the
+    per-channel failure log is auditable.
     """
     incident.notification_attempted_at = attempted_at
     incident.notification_status = "failed"
@@ -289,6 +372,7 @@ async def mark_notification_failed(
     await transition_incident(db, incident, "notification_failed", {
         "attempts": attempts,
         "error": (error or "")[:500],
+        "channel_log": channel_log or [],
     })
 
     logger.error(

@@ -34,6 +34,8 @@ from app.incidents import service as incident_service
 from app.incidents import alerting
 from app.incidents.scoring import calculate_criticality, _score_to_severity
 from app.incidents.anomaly import detect_anomaly
+from app.incidents.metrics import record_event_metrics, detect_baseline_anomaly
+from app.redaction import redact_payload
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -133,7 +135,7 @@ async def _save_dead_letter(source: str, payload: dict, received_at_iso: str, er
         db.add(DeadLetterEvent(
             id=uuid.uuid4(),
             source=source,
-            raw_payload=payload,
+            raw_payload=redact_payload(payload),
             received_at=received_at,
             error=error[:2000],
         ))
@@ -162,7 +164,10 @@ async def _process(source: str, payload: dict, received_at_iso: str):
                 id=uuid.uuid4(),
                 source=source,
                 received_at=received_at,
-                raw_payload=payload,
+                # PII is scrubbed (ids hashed, emails/secrets masked) BEFORE the
+                # forensic copy is persisted. The idempotency key is computed from
+                # the original payload above, so dedup is unaffected.
+                raw_payload=redact_payload(payload),
                 processed=False,
                 idempotency_key=idem_key,
             )
@@ -187,6 +192,10 @@ async def _process(source: str, payload: dict, received_at_iso: str):
         # ── Step 4: Save normalized event + link to incident ─────────────────
         await incident_service.save_normalized_event(db, raw_event_id, normalized, incident)
 
+        # ── Step 4b: Fold the event into the agent's self-built metric buckets ─
+        # (per-minute, per-dimension) so rolling baselines exist for next time.
+        await record_event_metrics(db, normalized, payload, now=received_at)
+
         # ── Step 5: Calculate criticality score ──────────────────────────────
         # Sliding-window error rate (last VELOCITY_WINDOW_SECONDS) for this fingerprint.
         events_in_window = _record_and_count_velocity(
@@ -205,7 +214,15 @@ async def _process(source: str, payload: dict, received_at_iso: str):
         # Product events may carry a metrics payload (failure/pending rates, p95
         # latency, volume series). A tripped anomaly forces an alert and boosts the
         # score even when no single error looks severe.
-        anomaly = detect_anomaly(payload.get("metrics") if isinstance(payload, dict) else None)
+        # Two complementary sources: an explicit metrics payload (producer-computed)
+        # and the agent's OWN rolling baseline over the MetricBucket series. Take
+        # whichever fires harder so a self-detected degradation can force an alert.
+        payload_anomaly = detect_anomaly(payload.get("metrics") if isinstance(payload, dict) else None)
+        baseline_anomaly = await detect_baseline_anomaly(db, normalized, now=received_at)
+        anomaly = max(
+            (payload_anomaly, baseline_anomaly),
+            key=lambda a: (a.is_anomaly, a.severity_boost),
+        )
         if anomaly.is_anomaly:
             scoring.total_score += anomaly.severity_boost
             scoring.severity = _score_to_severity(scoring.total_score)
