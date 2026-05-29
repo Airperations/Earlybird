@@ -26,7 +26,9 @@ def upgrade() -> None:
         sa.Column("event_timestamp", sa.DateTime(timezone=True), nullable=True),
         sa.Column("raw_payload", postgresql.JSONB(), nullable=False),
         sa.Column("processed", sa.Boolean(), nullable=True),
+        sa.Column("idempotency_key", sa.String(64), nullable=True),
     )
+    op.create_index("ix_raw_events_idempotency_key", "raw_events", ["idempotency_key"], unique=True)
 
     op.create_table(
         "normalized_events",
@@ -122,8 +124,20 @@ def upgrade() -> None:
         sa.Column("details", postgresql.JSONB(), nullable=True),
     )
 
+    op.create_table(
+        "dead_letter_events",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("source", sa.String(50), nullable=False),
+        sa.Column("raw_payload", postgresql.JSONB(), nullable=False),
+        sa.Column("received_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("error", sa.Text(), nullable=True),
+        sa.Column("failed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("replayed", sa.Boolean(), nullable=True),
+    )
+
 
 def downgrade() -> None:
+    op.drop_table("dead_letter_events")
     op.drop_table("audit_log")
     op.drop_index("ix_incident_freshdesk_matches_ticket", table_name="incident_freshdesk_matches")
     op.drop_table("incident_freshdesk_matches")

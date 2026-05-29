@@ -4,16 +4,38 @@ Exposes the bounty metrics: win rate, incident table, lead times.
 This is what the judges see.
 """
 
-from fastapi import APIRouter, Depends
+import hmac
+import logging
+
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, case
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
+from app.config import settings
 from app.database import get_db
 from app.models import Incident, IncidentFreshdeskMatch, FreshdeskTicket
 
-router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def require_dashboard_key(x_dashboard_key: Optional[str] = Header(default=None)):
+    """
+    Gate the dashboard metrics. When DASHBOARD_API_KEY is set, callers must send
+    `x-dashboard-key: <key>`. When unset, access is open (dev/demo) but logged —
+    the dashboard leaks incident titles, error text and regions, so set a key
+    before exposing it publicly.
+    """
+    expected = settings.DASHBOARD_API_KEY
+    if not expected:
+        logger.warning("[DASHBOARD] DASHBOARD_API_KEY not set — metrics endpoints are UNAUTHENTICATED")
+        return
+    if not (x_dashboard_key and hmac.compare_digest(x_dashboard_key, expected)):
+        raise HTTPException(status_code=401, detail="Invalid or missing dashboard key")
+
+
+router = APIRouter(dependencies=[Depends(require_dashboard_key)])
 
 
 @router.get("/summary")

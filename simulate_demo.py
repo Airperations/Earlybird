@@ -11,17 +11,46 @@ Scenario:
   - Dashboard shows: Agent Won with +180s lead time
 """
 
+import os
+import sys
+import argparse
 import requests
 import time
 import json
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-API_BASE = "http://localhost:8000"
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 
 def log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
+
+
+def guard_against_production(api_base: str, force: bool) -> None:
+    """
+    This script injects FAKE incidents and a FAKE Freshdesk ticket. Running it
+    against a live deployment pollutes the 30-day win-rate metric. Refuse to run
+    against a non-local host unless explicitly forced AND interactively confirmed.
+    """
+    host = (urlparse(api_base).hostname or "").lower()
+    if host in _LOCAL_HOSTS:
+        return
+    log(f"⚠️  Target '{api_base}' is NOT localhost — this injects fake data into a real system.")
+    if not force:
+        log("   Refusing to run. Re-run with --force if you really mean it.")
+        sys.exit(1)
+    if sys.stdin.isatty():
+        answer = input("   Type CONFIRM to proceed against this non-local target: ").strip()
+        if answer != "CONFIRM":
+            log("   Aborted.")
+            sys.exit(1)
+    else:
+        log("   Non-interactive shell with --force — refusing to guess. Aborting.")
+        sys.exit(1)
 
 
 def simulate_sentry_webhook():
@@ -76,6 +105,16 @@ def simulate_freshdesk_ticket():
 
 
 def main():
+    global API_BASE
+    parser = argparse.ArgumentParser(description="Earlybird end-to-end demo simulation")
+    parser.add_argument("--api-base", default=API_BASE, help="API base URL (default: %(default)s)")
+    parser.add_argument("--force", action="store_true",
+                        help="Allow running against a non-local API (requires interactive CONFIRM)")
+    args = parser.parse_args()
+
+    API_BASE = args.api_base
+    guard_against_production(API_BASE, args.force)
+
     print("\n" + "="*60)
     print("  EARLYBIRD — DEMO SIMULATION")
     print("="*60 + "\n")

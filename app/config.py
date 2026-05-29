@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     SLACK_WEBHOOK_URL: str = ""
     SLACK_ALERT_CHANNEL: str = "#earlybird-alerts"
 
+    # Dashboard auth — when set, /dashboard/* requires header `x-dashboard-key`.
+    DASHBOARD_API_KEY: Optional[str] = None
+
     # Freshdesk
     FRESHDESK_DOMAIN: str = ""           # e.g. "airdrive.freshdesk.com"
     FRESHDESK_API_KEY: str = ""

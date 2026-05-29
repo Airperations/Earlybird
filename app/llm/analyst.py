@@ -9,6 +9,7 @@ import json
 import logging
 from typing import Optional
 from app.config import settings
+from app.redaction import redact_pii
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,8 @@ def build_incident_context(
         "countries": countries,
         "severity": severity,
         "score": score,
-        "error_message": message,
+        # Redact PII before the error text leaves our boundary to Anthropic.
+        "error_message": redact_pii(message),
         "exception_type": exception_type,
         "first_seen_at": first_seen_at,
         "last_seen_at": last_seen_at,

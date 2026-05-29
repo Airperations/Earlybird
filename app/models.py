@@ -28,6 +28,10 @@ class RawEvent(Base):
     event_timestamp = Column(DateTime(timezone=True), nullable=True)
     raw_payload = Column(JSONB, nullable=False)
     processed = Column(Boolean, default=False)
+    # Deterministic key over (source, received_at, payload). Lets a redelivered
+    # Celery task (acks_late at-least-once) recognize a duplicate instead of
+    # inserting a second raw event and double-counting the incident.
+    idempotency_key = Column(String(64), nullable=True, unique=True, index=True)
 
     normalized_events = relationship("NormalizedEvent", back_populates="raw_event")
 
@@ -160,3 +164,20 @@ class AuditLog(Base):
     event = Column(String(255), nullable=False)
     timestamp = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     details = Column(JSONB, nullable=True)
+
+
+class DeadLetterEvent(Base):
+    """
+    Events that failed every Celery retry land here instead of vanishing.
+    A human (or a replay job) can inspect and re-drive them — this is the
+    durable dead-letter queue backing the 'no event is dropped' guarantee.
+    """
+    __tablename__ = "dead_letter_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source = Column(String(50), nullable=False)
+    raw_payload = Column(JSONB, nullable=False)
+    received_at = Column(DateTime(timezone=True), nullable=True)
+    error = Column(Text, nullable=True)
+    failed_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    replayed = Column(Boolean, default=False)
