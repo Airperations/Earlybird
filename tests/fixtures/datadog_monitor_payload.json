@@ -1,0 +1,28 @@
+{
+  "id": "8675309",
+  "event_id": "8675309",
+  "monitor_id": "12345",
+  "monitor_name": "Withdrawal success rate (MX)",
+  "alert_type": "error",
+  "alert_status": "Triggered",
+  "title": "[Triggered] Withdrawal success rate dropped in MX",
+  "message": "Withdrawal success rate for payments-api fell below threshold in MX via stripe.",
+  "url": "https://api.airdrive.com/api/v1/withdraw/confirm",
+  "timestamp": "2026-05-29T18:43:05Z",
+  "tags": [
+    "service:payments-api",
+    "env:production",
+    "country:MX",
+    "provider:stripe",
+    "payment_method:card",
+    "platform:ios"
+  ],
+  "metrics": {
+    "total_count": 200,
+    "success_count": 118,
+    "failure_count": 78,
+    "pending_count": 4,
+    "p95_latency_ms": 4200,
+    "critical": true
+  }
+}

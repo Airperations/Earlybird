@@ -76,14 +76,15 @@ def classify_event_outcome(normalized: NormalizedEventSchema, payload: Optional[
     """
     raw = None
     if isinstance(payload, dict):
-        raw = payload.get("outcome") or payload.get("status")
+        # `alert_status` is the Datadog monitor transition (Triggered/Recovered/…).
+        raw = payload.get("outcome") or payload.get("status") or payload.get("alert_status")
     if raw:
         r = str(raw).lower()
-        if r in ("success", "ok", "succeeded", "completed", "settled", "approved"):
+        if r in ("success", "ok", "succeeded", "completed", "settled", "approved", "recovered", "resolved"):
             return "success"
-        if r in ("pending", "processing", "stuck", "queued", "in_progress"):
+        if r in ("pending", "processing", "stuck", "queued", "in_progress", "warn", "warning", "no data"):
             return "pending"
-        if r in ("failed", "failure", "error", "declined", "rejected", "timeout"):
+        if r in ("failed", "failure", "error", "declined", "rejected", "timeout", "triggered", "alert"):
             return "failure"
 
     if normalized.exception_type:
@@ -103,9 +104,40 @@ def _dimension_cells(normalized: NormalizedEventSchema):
     return cells
 
 
+def _int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _aggregate_counts(payload: Optional[dict]) -> Optional[dict]:
+    """
+    If the payload carries pre-aggregated metric counts (e.g. a Datadog monitor /
+    custom webhook ``metrics`` block), return them as a counts delta so a single
+    event can fold N transactions into the buckets. Returns None for an ordinary
+    single event (caller falls back to a +1 increment).
+
+    Recognised keys: total_count, success_count, failure_count, pending_count.
+    """
+    metrics = payload.get("metrics") if isinstance(payload, dict) else None
+    if not isinstance(metrics, dict):
+        return None
+    keys = ("total_count", "success_count", "failure_count", "pending_count")
+    if not any(metrics.get(k) is not None for k in keys):
+        return None
+    success = _int(metrics.get("success_count")) or 0
+    failure = _int(metrics.get("failure_count")) or 0
+    pending = _int(metrics.get("pending_count")) or 0
+    total = _int(metrics.get("total_count"))
+    if total is None:
+        total = success + failure + pending
+    return {"total": total, "success": success, "failure": failure, "pending": pending}
+
+
 async def _upsert_bucket(
     db: AsyncSession, minute: datetime, action: str, dimension: str,
-    value: str, outcome: str, latency_ms: Optional[float],
+    value: str, counts: dict, latency_ms: Optional[float],
 ) -> None:
     """Increment (or create) one metric cell. Concurrency-safe via a savepoint."""
     bucket = (await db.execute(
@@ -138,13 +170,10 @@ async def _upsert_bucket(
                 .where(MetricBucket.dimension_value == value)
             )).scalar_one()
 
-    bucket.total_count += 1
-    if outcome == "success":
-        bucket.success_count += 1
-    elif outcome == "pending":
-        bucket.pending_count += 1
-    else:
-        bucket.failure_count += 1
+    bucket.total_count += counts["total"]
+    bucket.success_count += counts["success"]
+    bucket.pending_count += counts["pending"]
+    bucket.failure_count += counts["failure"]
     if latency_ms is not None:
         try:
             lm = float(latency_ms)
@@ -174,10 +203,27 @@ async def record_event_metrics(
     now = now or datetime.now(timezone.utc)
     minute = floor_minute(now)
     outcome = classify_event_outcome(normalized, payload)
-    latency_ms = (payload or {}).get("latency_ms") if isinstance(payload, dict) else None
+
+    # A Datadog monitor / custom webhook can carry pre-aggregated counts; fold all
+    # of them in. An ordinary single event is just a +1 in its classified bucket.
+    counts = _aggregate_counts(payload)
+    if counts is None:
+        counts = {
+            "total": 1,
+            "success": 1 if outcome == "success" else 0,
+            "pending": 1 if outcome == "pending" else 0,
+            "failure": 1 if outcome == "failure" else 0,
+        }
+
+    latency_ms = None
+    if isinstance(payload, dict):
+        latency_ms = payload.get("latency_ms")
+        if latency_ms is None and isinstance(payload.get("metrics"), dict):
+            # Datadog metric blocks report p95 latency; use it as one latency sample.
+            latency_ms = payload["metrics"].get("p95_latency_ms")
 
     for dimension, value in _dimension_cells(normalized):
-        await _upsert_bucket(db, minute, action, dimension, value, outcome, latency_ms)
+        await _upsert_bucket(db, minute, action, dimension, value, counts, latency_ms)
     return outcome
 
 
