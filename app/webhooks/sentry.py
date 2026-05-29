@@ -9,7 +9,7 @@ import json
 import logging
 
 from app.config import settings
-from app.webhooks.security import verify_hmac_signature, parse_json_or_400
+from app.webhooks.security import verify_hmac_signature, parse_json_or_400, enforce_replay_protection
 from app.workers.process_event import process_incoming_event
 
 router = APIRouter()
@@ -35,6 +35,9 @@ async def receive_sentry_webhook(request: Request, background_tasks: BackgroundT
         sig = request.headers.get("sentry-hook-signature", "")
         if not verify_hmac_signature(body, sig, settings.SENTRY_WEBHOOK_SECRET):
             raise HTTPException(status_code=401, detail="Invalid or missing Sentry signature")
+
+    # === STEP 3b: Replay protection (freshness + single-use nonce) ===
+    await enforce_replay_protection(request, "sentry")
 
     try:
         payload = json.loads(body) if body else {}

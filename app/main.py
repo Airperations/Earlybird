@@ -3,6 +3,8 @@ Earlybird — Main FastAPI Application
 Entry point for webhook ingestion and API endpoints.
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,11 +28,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup/shutdown via the modern lifespan API (replaces the deprecated
+    @app.on_event hooks).
+
+    Schema is managed by Alembic (`alembic upgrade head`), run as a deploy step
+    before this process starts — see Procfile / docker-compose. We no longer call
+    create_all here, because it cannot evolve an existing schema and masks drift.
+    """
+    logger.info("✅ Earlybird started successfully")
+    yield
+    await engine.dispose()
+    logger.info("👋 Earlybird shut down cleanly")
+
+
 # Create FastAPI app
 app = FastAPI(
     title="Earlybird",
     description="Early Incident Detection & Freshdesk Benchmarking System",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -39,16 +59,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-async def startup():
-    """
-    Schema is managed by Alembic (`alembic upgrade head`), run as a deploy step
-    before this process starts — see Procfile / docker-compose. We no longer call
-    create_all here, because it cannot evolve an existing schema and masks drift.
-    """
-    logger.info("✅ Earlybird started successfully")
 
 
 @app.get("/health")

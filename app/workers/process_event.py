@@ -36,9 +36,11 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Synchronous Redis client used only for the cross-worker alert lock below.
+# Synchronous Redis client used for the cross-worker alert lock and the
+# sliding-window error-velocity counter below.
 _redis = redis.Redis.from_url(settings.REDIS_URL)
 ALERT_LOCK_TTL_SECONDS = 300
+VELOCITY_WINDOW_SECONDS = 300  # 5 minutes
 
 
 def _acquire_alert_lock(fingerprint: str) -> bool:
@@ -67,6 +69,28 @@ def _idempotency_key(source: str, received_at_iso: str, payload: dict) -> str:
     """Deterministic across redeliveries: same (source, timestamp, payload) → same key."""
     blob = f"{source}|{received_at_iso}|{json.dumps(payload, sort_keys=True, default=str)}"
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _record_and_count_velocity(fingerprint: str, member: str, now_epoch: float):
+    """
+    True sliding-window error rate: track event timestamps for a fingerprint in a
+    Redis sorted set, trim everything older than the window, and return how many
+    remain. This distinguishes a real burst from a slow trickle, unlike dividing a
+    cumulative count by a fixed window. Returns None on Redis error (caller falls
+    back to the cumulative event_count).
+    """
+    key = f"earlybird:velocity:{fingerprint}"
+    try:
+        pipe = _redis.pipeline()
+        pipe.zadd(key, {member: now_epoch})
+        pipe.zremrangebyscore(key, 0, now_epoch - VELOCITY_WINDOW_SECONDS)
+        pipe.zcard(key)
+        pipe.expire(key, VELOCITY_WINDOW_SECONDS)
+        results = pipe.execute()
+        return int(results[2])
+    except Exception as e:
+        logger.warning(f"[WORKER] Velocity window unavailable ({e}); using cumulative count")
+        return None
 
 
 @celery_app.task(
@@ -162,12 +186,17 @@ async def _process(source: str, payload: dict, received_at_iso: str):
         await incident_service.save_normalized_event(db, raw_event_id, normalized, incident)
 
         # ── Step 5: Calculate criticality score ──────────────────────────────
+        # Sliding-window error rate (last VELOCITY_WINDOW_SECONDS) for this fingerprint.
+        events_in_window = _record_and_count_velocity(
+            normalized.fingerprint, raw_event_id, received_at.timestamp()
+        )
         scoring = calculate_criticality(
             event=normalized,
             affected_users=incident.affected_users_count,
             event_count=incident.event_count,
             countries=list(incident.countries or []),
             has_existing_tickets=False,  # Freshdesk check happens async
+            events_in_window=events_in_window,
         )
 
         await incident_service.update_incident_score(db, incident, scoring)

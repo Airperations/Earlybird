@@ -64,9 +64,16 @@ def score_affected_users(count: int) -> int:
     return 0
 
 
-def score_error_velocity(event_count: int, window_minutes: int = 5) -> int:
-    """Score based on error growth rate within a short window."""
-    rate = event_count / max(window_minutes, 1)
+def score_error_velocity(events_in_window: int, window_minutes: int = 5) -> int:
+    """
+    Score based on error rate (errors per minute) within a recent window.
+
+    `events_in_window` should be the count of events seen in the last
+    `window_minutes` minutes — a true sliding window, not a cumulative total.
+    The caller supplies this from Redis (see workers.process_event); when no
+    windowed count is available it falls back to the incident's event_count.
+    """
+    rate = events_in_window / max(window_minutes, 1)
     if rate >= 20:
         return 60
     elif rate >= 10:
@@ -130,14 +137,20 @@ def calculate_criticality(
     event_count: int = 1,
     countries: list = None,
     has_existing_tickets: bool = False,
+    events_in_window: Optional[int] = None,
 ) -> ScoringResult:
     """
     Calculate the full business criticality score for an incident.
     Returns a ScoringResult with breakdown for transparency.
+
+    `events_in_window` is the count of events in the recent sliding window
+    (errors/min basis). When None we fall back to the cumulative event_count.
     """
     path_score, owner = score_critical_path(event.endpoint)
     user_score = score_affected_users(affected_users)
-    velocity_score = score_error_velocity(event_count)
+    velocity_score = score_error_velocity(
+        events_in_window if events_in_window is not None else event_count
+    )
     status_score = score_http_status(event.http_status)
     country_score = score_country_concentration(countries or [])
     freshdesk_score = score_freshdesk_awareness(has_existing_tickets)

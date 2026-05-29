@@ -123,6 +123,27 @@ def upgrade() -> None:
         sa.Column("timestamp", sa.DateTime(timezone=True), nullable=False),
         sa.Column("details", postgresql.JSONB(), nullable=True),
     )
+    # Make the audit trail genuinely append-only: a BEFORE UPDATE/DELETE trigger
+    # rejects any mutation, so "immutable evidence" is enforced by the database
+    # rather than by convention. (A complementary hardening is to grant the app
+    # role only INSERT/SELECT on this table; the trigger protects even superusers.)
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION earlybird_audit_log_immutable()
+        RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'audit_log is append-only; % is not permitted', TG_OP;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER audit_log_no_update_delete
+        BEFORE UPDATE OR DELETE ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION earlybird_audit_log_immutable();
+        """
+    )
 
     op.create_table(
         "dead_letter_events",
@@ -138,6 +159,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("dead_letter_events")
+    op.execute("DROP TRIGGER IF EXISTS audit_log_no_update_delete ON audit_log")
+    op.execute("DROP FUNCTION IF EXISTS earlybird_audit_log_immutable()")
     op.drop_table("audit_log")
     op.drop_index("ix_incident_freshdesk_matches_ticket", table_name="incident_freshdesk_matches")
     op.drop_table("incident_freshdesk_matches")

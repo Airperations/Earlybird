@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import logging
 
 from app.config import settings
-from app.webhooks.security import require_shared_secret, parse_json_or_400
+from app.webhooks.security import require_shared_secret, parse_json_or_400, enforce_replay_protection
 from app.workers.process_event import process_incoming_event
 
 router = APIRouter()
@@ -28,6 +28,7 @@ async def receive_product_event(request: Request, background_tasks: BackgroundTa
     """
     received_at = datetime.now(timezone.utc)
     require_shared_secret(request, settings.PRODUCT_WEBHOOK_SECRET, "product")
+    await enforce_replay_protection(request, "product")
     payload = await parse_json_or_400(request)
 
     logger.info(f"[PRODUCT] Event received at {received_at.isoformat()}")

@@ -10,7 +10,7 @@ import logging
 
 from app.config import settings
 from app.database import get_db
-from app.webhooks.security import require_shared_secret, parse_json_or_400
+from app.webhooks.security import require_shared_secret, parse_json_or_400, enforce_replay_protection
 from app.workers.freshdesk_sync import sync_freshdesk_tickets
 
 router = APIRouter()
@@ -27,6 +27,7 @@ async def freshdesk_webhook(request: Request, background_tasks: BackgroundTasks)
     """
     received_at = datetime.now(timezone.utc)
     require_shared_secret(request, settings.FRESHDESK_WEBHOOK_SECRET, "freshdesk")
+    await enforce_replay_protection(request, "freshdesk")
     payload = await parse_json_or_400(request)
 
     logger.info(f"[FRESHDESK WEBHOOK] Ticket received at {received_at.isoformat()}: {payload.get('id')}")
