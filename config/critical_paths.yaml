@@ -1,0 +1,35 @@
+critical_paths:
+  - path: "/withdraw"
+    score: 50
+    owner: "payments"
+    business_area: "withdrawals"
+
+  - path: "/deposit"
+    score: 50
+    owner: "payments"
+    business_area: "deposits"
+
+  - path: "/p2p"
+    score: 45
+    owner: "marketplace"
+    business_area: "p2p"
+
+  - path: "/crypto"
+    score: 45
+    owner: "crypto"
+    business_area: "crypto"
+
+  - path: "/auth"
+    score: 40
+    owner: "identity"
+    business_area: "authentication"
+
+  - path: "/kyc"
+    score: 35
+    owner: "compliance"
+    business_area: "kyc"
+
+  - path: "/profile"
+    score: 10
+    owner: "product"
+    business_area: "user_profile"
