@@ -7,24 +7,33 @@ This is the RACE RESULT calculator — the core bounty metric.
 import re
 import uuid
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Optional, List, Dict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models import Incident, FreshdeskTicket, IncidentFreshdeskMatch, AuditLog
+from app.redaction import redact_pii
+from app.taxonomy import detect_keyword_overlap, base_action, ALL_KEYWORDS
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Keywords that indicate financial/platform issues in tickets
-FINANCIAL_KEYWORDS = {
-    "withdraw", "deposit", "transfer", "payment", "transaction",
-    "p2p", "crypto", "balance", "send", "receive", "failed",
-    "error", "not working", "issue", "problem", "can't", "unable",
-    "retiro", "depósito", "transferencia", "pago", "saldo",
-    "falla", "error", "no funciona", "problema",
-}
+# Backwards-compatible alias — the flat keyword set now lives in app.taxonomy.
+FINANCIAL_KEYWORDS = ALL_KEYWORDS
+
+
+@dataclass
+class MatchExplanation:
+    """
+    A transparent, language-agnostic explanation of why a ticket matched an
+    incident. `matched_by` uses a fixed generic vocabulary; `match_reasons`
+    carries the human-readable specifics (including detected keyword language).
+    """
+    confidence: float
+    matched_by: List[str] = field(default_factory=list)
+    match_reasons: Dict = field(default_factory=dict)
 
 
 def normalize_tags(raw) -> List[str]:
@@ -85,57 +94,96 @@ def _semantic_overlap(incident: Incident, ticket_text: str) -> float:
     return min(0.2, jaccard * 0.6)
 
 
-def calculate_match_confidence(incident: Incident, ticket: dict) -> float:
+def explain_match(incident: Incident, ticket: dict) -> MatchExplanation:
     """
-    Hybrid confidence that a ticket relates to an incident, in [0.0, 1.0].
+    Hybrid, auditable match explanation — deliberately NOT LLM-only, so a model
+    hallucination alone can neither fabricate nor destroy a match.
 
-    Four independent signal families — deliberately NOT LLM-only, so a model
-    hallucination can't fabricate a match:
-      • metadata  — country/region tag overlap
-      • time      — proximity of ticket creation to the alert
-      • keyword   — financial/platform vocabulary overlap (EN + ES)
-      • semantic  — content-word overlap with the incident's known text
+    Independent signal families, each contributing both confidence and a
+    `matched_by` tag with structured reasons:
+      • business_action — incident's normalized action appears in the ticket
+      • country         — region tag overlap
+      • provider        — incident provider named in the ticket
+      • payment_method  — incident payment method named in the ticket
+      • time_window     — proximity of ticket creation to the alert
+      • keyword_match   — multilingual keyword-group overlap (language-agnostic)
+      • (semantic)      — content-word overlap; folds into confidence only
     """
     score = 0.0
+    matched_by: List[str] = []
+    reasons: Dict = {}
 
-    ticket_text = (
-        (ticket.get("subject") or "") + " " +
-        (ticket.get("description_text") or ticket.get("description") or "")
-    ).lower()
+    subject = ticket.get("subject") or ""
+    description = ticket.get("description_text") or ticket.get("description") or ""
+    ticket_text = f"{subject} {description}".lower()
 
-    # Signal 1: Endpoint / affected-area keyword match
-    endpoint_parts = [p for p in (incident.llm_summary or {}).get("affected_area", "").lower().split() if len(p) > 3]
-    for part in endpoint_parts:
-        if part in ticket_text:
-            score += 0.3
-            break
+    # Signal: business action (e.g. ticket about a "withdrawal" for a withdrawal incident).
+    kw = detect_keyword_overlap(ticket_text, incident.business_action)
+    if kw["action_match"] and incident.business_action:
+        score += 0.3
+        matched_by.append("business_action")
+        reasons["business_action"] = incident.business_action
+        reasons["normalized_business_action"] = base_action(incident.business_action)
 
-    # Signal 2: Financial keyword overlap (keyword signal)
-    ticket_keywords = set(ticket_text.split()) & FINANCIAL_KEYWORDS
-    if ticket_keywords:
-        score += min(0.2, len(ticket_keywords) * 0.05)
-
-    # Signal 3: Country match (metadata signal)
+    # Signal: country (metadata).
     incident_countries = {str(c).upper() for c in (incident.countries or [])}
-    ticket_tags = normalize_tags(ticket.get("tags"))
-    if incident_countries & set(ticket_tags):
+    if incident.primary_country:
+        incident_countries.add(str(incident.primary_country).upper())
+    ticket_tags = set(normalize_tags(ticket.get("tags")))
+    country_hit = incident_countries & ticket_tags
+    if country_hit:
         score += 0.2
+        matched_by.append("country")
+        reasons["country"] = sorted(country_hit)[0]
 
-    # Signal 4: Time proximity (time signal)
+    # Signal: provider named in the ticket text.
+    if incident.provider and str(incident.provider).lower() in ticket_text:
+        score += 0.15
+        matched_by.append("provider")
+        reasons["provider"] = incident.provider
+
+    # Signal: payment method named in the ticket text.
+    if incident.payment_method and str(incident.payment_method).lower() in ticket_text:
+        score += 0.1
+        matched_by.append("payment_method")
+        reasons["payment_method"] = incident.payment_method
+
+    # Signal: time proximity to the benchmark timestamp.
     ticket_created = _parse_freshdesk_time(ticket.get("created_at"))
     if ticket_created and incident.agent_alert_timestamp:
-        delta = abs((ticket_created - incident.agent_alert_timestamp).total_seconds())
-        if delta <= 300:      # Within 5 min
+        signed = int((ticket_created - incident.agent_alert_timestamp).total_seconds())
+        delta = abs(signed)
+        if delta <= 300:
             score += 0.3
-        elif delta <= 900:    # Within 15 min
+        elif delta <= 900:
             score += 0.2
-        elif delta <= 3600:   # Within 1 hour
+        elif delta <= 3600:
             score += 0.1
+        if delta <= 3600:
+            matched_by.append("time_window")
+            reasons["time_delta_seconds"] = signed
 
-    # Signal 5: Semantic content-word overlap
+    # Signal: multilingual keyword-group overlap (generic label + detected language).
+    if kw["overlap"]:
+        score += min(0.2, len(kw["overlap"]) * 0.05)
+        matched_by.append("keyword_match")
+        reasons["keyword_overlap"] = kw["overlap"]
+        reasons["keyword_group"] = kw["groups"]
+        reasons["keyword_language"] = kw["language"]
+
+    # Signal: semantic content-word overlap (confidence only; no matched_by tag).
     score += _semantic_overlap(incident, ticket_text)
 
-    return min(1.0, score)
+    return MatchExplanation(
+        confidence=min(1.0, score),
+        matched_by=matched_by,
+        match_reasons=reasons,
+    )
+
+
+def calculate_match_confidence(incident: Incident, ticket: dict) -> float:
+    """Confidence-only wrapper around explain_match (back-compat for callers/tests)."""
+    return explain_match(incident, ticket).confidence
 
 
 # Backward-compatible alias (older callers / tests used the private name).
@@ -196,7 +244,7 @@ async def match_incidents_to_freshdesk(
             continue
 
         best_incident = None
-        best_confidence = 0.0
+        best_explanation: Optional[MatchExplanation] = None
 
         for incident in incidents:
             # Only match within the configurable time window.
@@ -206,14 +254,14 @@ async def match_incidents_to_freshdesk(
             if not (window_start <= ticket_created <= window_end):
                 continue
 
-            confidence = calculate_match_confidence(incident, ticket)
-            if confidence > best_confidence:
-                best_confidence = confidence
+            explanation = explain_match(incident, ticket)
+            if best_explanation is None or explanation.confidence > best_explanation.confidence:
+                best_explanation = explanation
                 best_incident = incident
 
         # Only record matches above the configurable confidence threshold.
-        if best_incident and best_confidence >= confidence_threshold:
-            await _record_match(db, best_incident, ticket, ticket_created, best_confidence)
+        if best_incident and best_explanation and best_explanation.confidence >= confidence_threshold:
+            await _record_match(db, best_incident, ticket, ticket_created, best_explanation)
 
 
 async def _record_match(
@@ -221,7 +269,7 @@ async def _record_match(
     incident: Incident,
     ticket: dict,
     ticket_created: datetime,
-    confidence: float,
+    explanation: MatchExplanation,
 ):
     """Record the race result between agent and Freshdesk."""
     agent_ts = incident.agent_alert_timestamp
@@ -229,6 +277,7 @@ async def _record_match(
 
     # Positive delta = agent won (alerted before ticket); negative = agent lost.
     outcome = classify_outcome(delta_seconds)
+    confidence = explanation.confidence
 
     match = IncidentFreshdeskMatch(
         id=uuid.uuid4(),
@@ -239,12 +288,16 @@ async def _record_match(
         time_delta_seconds=delta_seconds,
         outcome=outcome,
         confidence=confidence,
+        matched_by=explanation.matched_by,
+        match_reasons=explanation.match_reasons,
         evidence={
-            "ticket_subject": ticket.get("subject"),
-            "ticket_tags": ticket.get("tags"),
+            # Subject is redacted in case a user pasted PII into it.
+            "ticket_subject": redact_pii(ticket.get("subject")),
+            "ticket_tags": normalize_tags(ticket.get("tags")),
             "incident_severity": incident.severity,
             "incident_score": incident.score,
             "incident_fingerprint": incident.fingerprint,
+            "incident_business_action": incident.business_action,
         },
     )
     db.add(match)
@@ -261,6 +314,8 @@ async def _record_match(
             "delta_seconds": delta_seconds,
             "confidence": confidence,
             "outcome": outcome,
+            "matched_by": explanation.matched_by,
+            "match_reasons": explanation.match_reasons,
         },
     )
     db.add(audit)

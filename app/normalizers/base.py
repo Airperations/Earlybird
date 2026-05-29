@@ -11,6 +11,8 @@ from typing import Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from app.taxonomy import derive_business_action
+
 
 @dataclass
 class NormalizedEventSchema:
@@ -30,6 +32,10 @@ class NormalizedEventSchema:
     fingerprint: str
     raw_payload: dict
     event_timestamp: Optional[datetime] = None
+    # Structured business metadata (lets an incident describe itself without the LLM).
+    provider: Optional[str] = None          # payment / infra provider, e.g. "stripe"
+    payment_method: Optional[str] = None    # e.g. "card", "bank_transfer", "crypto"
+    business_action: Optional[str] = None   # e.g. "withdrawal_failed" (see app.taxonomy)
 
 
 def normalize_sentry(payload: dict) -> NormalizedEventSchema:
@@ -76,6 +82,9 @@ def normalize_sentry(payload: dict) -> NormalizedEventSchema:
         fingerprint=fingerprint,
         raw_payload=payload,
         event_timestamp=_parse_iso(event.get("timestamp")),
+        provider=tags.get("provider"),
+        payment_method=tags.get("payment_method"),
+        business_action=derive_business_action(endpoint, http_status, exception_type),
     )
 
 
@@ -110,6 +119,9 @@ def normalize_datadog(payload: dict) -> NormalizedEventSchema:
         fingerprint=fingerprint,
         raw_payload=payload,
         event_timestamp=_parse_iso(payload.get("date")),
+        provider=tags.get("provider"),
+        payment_method=tags.get("payment_method"),
+        business_action=derive_business_action(endpoint, None, payload.get("alert_type")),
     )
 
 
@@ -139,6 +151,10 @@ def normalize_product_event(payload: dict) -> NormalizedEventSchema:
         fingerprint=fingerprint,
         raw_payload=payload,
         event_timestamp=_parse_iso(payload.get("timestamp")),
+        provider=payload.get("provider"),
+        payment_method=payload.get("payment_method"),
+        business_action=payload.get("business_action")
+        or derive_business_action(endpoint, payload.get("http_status"), payload.get("error_type")),
     )
 
 

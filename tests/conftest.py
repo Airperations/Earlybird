@@ -51,6 +51,7 @@ def make_normalized(**overrides):
         http_status=502, exception_type="GatewayTimeout", message="boom",
         user_id="u1", country="MX", platform="ios", release="v1",
         fingerprint="fp-test", raw_payload={},
+        provider=None, payment_method=None, business_action="withdrawal_failed",
     )
     defaults.update(overrides)
     return NormalizedEventSchema(**defaults)
@@ -71,8 +72,11 @@ def make_incident(status="observing", **overrides):
     defaults = dict(
         id=uuid.uuid4(), fingerprint="fp-test", status=status,
         first_seen_at=now, last_seen_at=now, affected_users_count=3,
-        affected_user_ids=["u1", "u2", "u3"], event_count=5, countries=["MX"],
+        affected_user_hashes=["u_a", "u_b", "u_c"], event_count=5, countries=["MX"],
         notification_status="pending", notification_attempts=0,
+        service="payments-api", endpoint="/withdraw/confirm",
+        business_action="withdrawal_failed", primary_country="MX",
+        provider=None, payment_method=None,
     )
     defaults.update(overrides)
     return Incident(**defaults)

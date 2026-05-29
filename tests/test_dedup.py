@@ -44,7 +44,8 @@ async def test_same_fingerprint_dedups_into_one_incident(db):
 
 @pytest.mark.asyncio
 async def test_distinct_users_are_tracked(db):
-    # Regression guard for audit fix C4.
+    # Regression guard for audit fix C4 — now tracked by SALTED HASH, never raw id.
+    from app.redaction import hash_identifier
     n1 = normalize_sentry(PAYLOAD)
     p2 = {**PAYLOAD, "event": {**PAYLOAD["event"], "user": {"id": "u2"}}}
     n2 = normalize_sentry(p2)
@@ -52,7 +53,10 @@ async def test_distinct_users_are_tracked(db):
     await db.flush()
     await service.find_or_create_incident(db, n2)
     assert inc.affected_users_count == 2
-    assert set(inc.affected_user_ids) == {"u1", "u2"}
+    assert set(inc.affected_user_hashes) == {hash_identifier("u1"), hash_identifier("u2")}
+    # And crucially: the raw ids are NOT present.
+    assert "u1" not in inc.affected_user_hashes
+    assert "u2" not in inc.affected_user_hashes
 
 
 @pytest.mark.asyncio

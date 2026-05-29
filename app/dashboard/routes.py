@@ -15,7 +15,7 @@ from typing import List, Optional
 
 from app.config import settings
 from app.database import get_db
-from app.models import Incident, IncidentFreshdeskMatch, FreshdeskTicket, AuditLog
+from app.models import Incident, IncidentFreshdeskMatch, FreshdeskTicket, AuditLog, MetricBucket
 
 logger = logging.getLogger(__name__)
 
@@ -65,23 +65,43 @@ async def get_dashboard_summary(db: AsyncSession = Depends(get_db)):
 
     win_rate = (agent_won / total_matched * 100) if total_matched > 0 else 0
 
-    # Lead times (only for wins)
-    win_deltas = [m.time_delta_seconds for m in matches if m.outcome == "agent_won" and m.time_delta_seconds]
+    # Lead times (only for wins, by the strict rule agent_alert < ticket_created).
+    win_deltas = sorted(m.time_delta_seconds for m in matches if m.outcome == "agent_won" and m.time_delta_seconds)
     avg_lead_time = sum(win_deltas) / len(win_deltas) if win_deltas else 0
-    median_lead_time = sorted(win_deltas)[len(win_deltas) // 2] if win_deltas else 0
+    median_lead_time = _percentile(win_deltas, 50)
+    p90_lead_time = _percentile(win_deltas, 90)
 
     # Incidents without any ticket (prevented)
     prevented = total_alerted - total_matched
 
-    # Failed deliveries are surfaced, never hidden — a failed notification is not
-    # a win and must be visible to the judges.
-    failed_result = await db.execute(
+    # ── Honesty metrics: surface where the agent lost or fell short ──────────
+    # Failed deliveries are never hidden — a failed notification is not a win.
+    notification_failed = (await db.execute(
         select(func.count(Incident.id)).where(Incident.notification_status == "failed")
-    )
-    notification_failed = failed_result.scalar()
+    )).scalar()
+
+    # Incidents we flagged as false positives (transparency about noise).
+    false_positives = (await db.execute(
+        select(func.count(Incident.id)).where(Incident.status == "false_positive")
+    )).scalar()
+
+    # We detected the issue but could not deliver the alert → a would-be early win
+    # lost purely to a delivery failure. The most honest counter we can show.
+    detected_not_delivered = (await db.execute(
+        select(func.count(Incident.id))
+        .where(Incident.detected_at.isnot(None))
+        .where(Incident.notification_status == "failed")
+    )).scalar()
+
+    # Freshdesk tickets we ingested but never matched to any incident — support
+    # caught something the agent didn't (or it was unrelated). Shown, not buried.
+    total_tickets = (await db.execute(select(func.count(FreshdeskTicket.id)))).scalar()
+    matched_ticket_ids = {m.freshdesk_ticket_id for m in matches}
+    unmatched_tickets = max(0, (total_tickets or 0) - len(matched_ticket_ids))
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "official_win_rule": "agent_alert_timestamp < freshdesk_ticket_created_at",
         "bounty_metric": {
             "win_rate_percent": round(win_rate, 1),
             "pass_bar_percent": 80,
@@ -94,17 +114,22 @@ async def get_dashboard_summary(db: AsyncSession = Depends(get_db)):
             "matched_to_freshdesk": total_matched,
             "prevented_no_ticket": prevented,
             "notification_failed": notification_failed,
+            "false_positives": false_positives,
+            "detected_but_delivery_failed": detected_not_delivered,
         },
         "race_results": {
             "agent_won": agent_won,
             "agent_lost": agent_lost,
             "ties": ties,
+            "unmatched_freshdesk_tickets": unmatched_tickets,
         },
         "lead_time": {
             "average_seconds": round(avg_lead_time),
             "median_seconds": round(median_lead_time),
+            "p90_seconds": round(p90_lead_time),
             "average_human": _seconds_to_human(avg_lead_time),
             "median_human": _seconds_to_human(median_lead_time),
+            "p90_human": _seconds_to_human(p90_lead_time),
         },
     }
 
@@ -138,6 +163,9 @@ async def get_incidents_table(db: AsyncSession = Depends(get_db)):
             "severity": inc.severity,
             "score": inc.score,
             "status": inc.status,
+            "business_action": inc.business_action,
+            "service": inc.service,
+            "provider": inc.provider,
             "affected_users": inc.affected_users_count,
             "event_count": inc.event_count,
             "countries": inc.countries,
@@ -229,6 +257,20 @@ async def get_judge_audit(db: AsyncSession = Depends(get_db), limit: int = 100):
             "severity": inc.severity,
             "score": inc.score,
             "status": inc.status,
+            # Structured metadata — answers what/where/who without the LLM summary.
+            "metadata": {
+                "service": inc.service,
+                "endpoint": inc.endpoint,
+                "route": inc.route,
+                "business_action": inc.business_action,
+                "http_status": inc.http_status,
+                "exception_type": inc.exception_type,
+                "primary_country": inc.primary_country,
+                "provider": inc.provider,
+                "platform": inc.platform,
+                "payment_method": inc.payment_method,
+                "affected_users_count": inc.affected_users_count,
+            },
             "lifecycle": {
                 "first_seen_at": inc.first_seen_at.isoformat() if inc.first_seen_at else None,
                 "detected_at": inc.detected_at.isoformat() if inc.detected_at else None,
@@ -237,6 +279,8 @@ async def get_judge_audit(db: AsyncSession = Depends(get_db), limit: int = 100):
                 "enriched_at": inc.enriched_at.isoformat() if inc.enriched_at else None,
                 "notification_status": inc.notification_status,
                 "notification_attempts": inc.notification_attempts,
+                # Which channel locked the benchmark timestamp (slack|pagerduty|email).
+                "notification_channel": inc.notification_channel,
             },
             # The benchmark field == delivery timestamp, by construction.
             "agent_alert_timestamp": inc.agent_alert_timestamp.isoformat() if inc.agent_alert_timestamp else None,
@@ -256,6 +300,9 @@ async def get_judge_audit(db: AsyncSession = Depends(get_db), limit: int = 100):
                 "outcome": match.outcome,
                 "outcome_label": _outcome_emoji(match.outcome),
                 "confidence": round(match.confidence, 2) if match.confidence is not None else None,
+                # Transparent, language-agnostic explanation of WHY it matched.
+                "matched_by": match.matched_by,
+                "match_reasons": match.match_reasons,
                 "evidence": match.evidence,
             },
             "audit_trail": audit_trail,
@@ -267,6 +314,77 @@ async def get_judge_audit(db: AsyncSession = Depends(get_db), limit: int = 100):
         "note": "Includes wins, losses, and failed notifications. Nothing is filtered.",
         "incidents": entries,
     }
+
+
+@router.get("/metrics")
+async def get_metrics(db: AsyncSession = Depends(get_db), limit: int = 50):
+    """
+    The agent's self-built rolling-baseline view. For each active metric cell
+    (business_action × dimension × value over the recent window), reports the
+    current vs baseline success rate and flags any live anomaly — the evidence
+    behind "withdrawal success rate in MX dropped 97% → 71%".
+    """
+    from datetime import timedelta
+    from app.incidents.metrics import floor_minute, analyze_series, _fold, as_aware
+    from app.taxonomy import CRITICAL_ACTIONS
+
+    now = datetime.now(timezone.utc)
+    current_minutes = settings.ANOMALY_CURRENT_WINDOW_MINUTES
+    baseline_minutes = settings.ANOMALY_BASELINE_WINDOW_MINUTES
+    current_start = floor_minute(now) - timedelta(minutes=current_minutes - 1)
+    baseline_start = current_start - timedelta(minutes=baseline_minutes)
+
+    rows = (await db.execute(
+        select(MetricBucket)
+        .where(MetricBucket.bucket_start >= baseline_start)
+        .order_by(MetricBucket.bucket_start.asc())
+    )).scalars().all()
+
+    cells = {}
+    for b in rows:
+        cells.setdefault((b.business_action, b.dimension, b.dimension_value), []).append(b)
+
+    out = []
+    for (action, dimension, value), buckets in cells.items():
+        current = [b for b in buckets if as_aware(b.bucket_start) >= current_start]
+        baseline = [b for b in buckets if as_aware(b.bucket_start) < current_start]
+        if not current:
+            continue
+        cur, base = _fold(current), _fold(baseline)
+        result = analyze_series(current, baseline, action=action, dimension=dimension,
+                                value=value, critical=action in CRITICAL_ACTIONS)
+        out.append({
+            "business_action": action,
+            "dimension": dimension,
+            "dimension_value": value,
+            "current": {"total": cur.total, "success_rate": round(cur.success_rate, 3) if cur.success_rate is not None else None},
+            "baseline": {"total": base.total, "success_rate": round(base.success_rate, 3) if base.success_rate is not None else None},
+            "anomaly": None if not result.is_anomaly else {
+                "kind": result.kind, "severity_boost": result.severity_boost, "detail": result.detail,
+            },
+        })
+
+    out.sort(key=lambda c: (c["anomaly"] is not None, c["current"]["total"]), reverse=True)
+    anomalies = [c for c in out if c["anomaly"]]
+    return {
+        "generated_at": now.isoformat(),
+        "window": {"current_minutes": current_minutes, "baseline_minutes": baseline_minutes},
+        "active_anomalies": len(anomalies),
+        "cells": out[:limit],
+    }
+
+
+def _percentile(sorted_values, pct: float) -> float:
+    """
+    Nearest-rank percentile of an already-sorted list. Returns 0 for an empty
+    list. p50 == median; p90 surfaces the slow tail the average can hide.
+    """
+    if not sorted_values:
+        return 0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = max(0, min(len(sorted_values) - 1, int(round((pct / 100.0) * (len(sorted_values) - 1)))))
+    return sorted_values[rank]
 
 
 def _seconds_to_human(seconds) -> str:

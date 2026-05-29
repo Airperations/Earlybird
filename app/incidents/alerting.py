@@ -31,6 +31,7 @@ from app.alerts.slack import (
     send_enrichment_followup,
     AlertDeliveryResult,
 )
+from app.alerts.channels import send_pagerduty_alert, send_email_alert
 from app.llm.analyst import generate_incident_summary, build_incident_context
 from app.redaction import redact_summary
 
@@ -41,25 +42,43 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def deliver_alert(
-    db: AsyncSession,
-    incident,
-    normalized: NormalizedEventSchema,
-    scoring: ScoringResult,
-    *,
-    send_alert: Callable[..., AlertDeliveryResult] = send_immediate_alert,
-    now: Callable[[], datetime] = _utcnow,
-) -> AlertDeliveryResult:
-    """
-    PHASE 1 — detect → minimal alert → record delivery outcome. NO LLM is called.
+def _fallback_content(incident, normalized, scoring):
+    """Build the summary/details/body the PagerDuty + email fallbacks need."""
+    countries = ", ".join(incident.countries or []) or "unknown"
+    summary = (
+        f"[{scoring.severity.upper()}] {normalized.service or 'service'} · "
+        f"{normalized.business_action or normalized.endpoint or 'anomaly'} "
+        f"({incident.affected_users_count} users, {incident.event_count} events, {countries})"
+    )
+    details = {
+        "incident_id": str(incident.id),
+        "fingerprint": normalized.fingerprint,
+        "business_action": normalized.business_action,
+        "service": normalized.service,
+        "endpoint": normalized.endpoint,
+        "http_status": normalized.http_status,
+        "score": scoring.total_score,
+        "severity": scoring.severity,
+        "countries": list(incident.countries or []),
+        "provider": normalized.provider,
+    }
+    body = summary + "\n\n" + "\n".join(f"{k}: {v}" for k, v in details.items())
+    return summary, details, f"Earlybird {scoring.severity.upper()}: {normalized.business_action or normalized.endpoint}", body
 
-    On confirmed delivery the official benchmark timestamp is set. On failure the
-    incident moves to notification_failed and the timestamp stays NULL.
-    """
-    detected_at = now()
-    await service.mark_detected(db, incident, detected_at, scoring.total_score)
 
-    result = send_alert(
+def _deliver_multichannel(
+    incident, normalized, scoring, *,
+    send_alert, send_pagerduty, send_email,
+):
+    """
+    Try Slack → PagerDuty → email, stopping at the first confirmed delivery.
+    Returns (result, channel_log). `result` is the delivering channel's result, or
+    the Slack result if every channel failed (so the failure record keeps Slack's
+    attempt count). The first delivered channel is what locks the timestamp.
+    """
+    channel_log = []
+
+    primary = send_alert(
         incident_id=str(incident.id),
         fingerprint=normalized.fingerprint,
         severity=scoring.severity,
@@ -69,12 +88,67 @@ async def deliver_alert(
         countries=list(incident.countries or []),
         endpoint=normalized.endpoint,
         service=normalized.service,
-        action=normalized.exception_type,
+        action=normalized.business_action or normalized.exception_type,
         platform=normalized.platform,
+        provider=normalized.provider,
         first_seen_at=incident.first_seen_at,
         last_seen_at=incident.last_seen_at,
         suggested_owner=scoring.suggested_owner,
         status="enriching…",
+    )
+    primary.channel = primary.channel or "slack"
+    channel_log.append({"channel": "slack", "delivered": primary.delivered,
+                        "attempts": primary.attempts, "error": primary.error})
+    if primary.delivered:
+        return primary, channel_log
+
+    # Slack failed → fallbacks. Build their content once.
+    summary, details, subject, body = _fallback_content(incident, normalized, scoring)
+
+    pd = send_pagerduty(incident_id=str(incident.id), severity=scoring.severity,
+                        summary=summary, custom_details=details)
+    channel_log.append({"channel": "pagerduty", "delivered": pd.delivered,
+                        "attempts": pd.attempts, "error": pd.error})
+    if pd.delivered:
+        return pd, channel_log
+
+    em = send_email(incident_id=str(incident.id), severity=scoring.severity,
+                    subject=subject, body=body)
+    channel_log.append({"channel": "email", "delivered": em.delivered,
+                        "attempts": em.attempts, "error": em.error})
+    if em.delivered:
+        return em, channel_log
+
+    # Everything failed — return the Slack result so attempts/error reflect the
+    # primary channel, with the full per-channel log for the audit trail.
+    return primary, channel_log
+
+
+async def deliver_alert(
+    db: AsyncSession,
+    incident,
+    normalized: NormalizedEventSchema,
+    scoring: ScoringResult,
+    *,
+    send_alert: Callable[..., AlertDeliveryResult] = send_immediate_alert,
+    send_pagerduty: Callable[..., AlertDeliveryResult] = send_pagerduty_alert,
+    send_email: Callable[..., AlertDeliveryResult] = send_email_alert,
+    now: Callable[[], datetime] = _utcnow,
+) -> AlertDeliveryResult:
+    """
+    PHASE 1 — detect → minimal alert (Slack → PagerDuty → email) → record outcome.
+    NO LLM is called.
+
+    On the FIRST confirmed delivery (any channel) the official benchmark timestamp
+    is set and the delivering channel is recorded. If every channel fails the
+    incident moves to notification_failed and the timestamp stays NULL.
+    """
+    detected_at = now()
+    await service.mark_detected(db, incident, detected_at, scoring.total_score)
+
+    result, channel_log = _deliver_multichannel(
+        incident, normalized, scoring,
+        send_alert=send_alert, send_pagerduty=send_pagerduty, send_email=send_email,
     )
 
     attempted_at = now()
@@ -88,10 +162,13 @@ async def deliver_alert(
             thread_ts=result.thread_ts,
             delivered_at=delivered_at,
             attempts=result.attempts,
+            channel=result.channel or "slack",
+            channel_log=channel_log,
         )
     else:
         await service.mark_notification_failed(
             db, incident, attempted_at, attempts=result.attempts, error=result.error,
+            channel_log=channel_log,
         )
 
     return result

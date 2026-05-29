@@ -28,11 +28,17 @@ The challenge is decided on a single comparison: **agent alert timestamp vs. Fre
 
 3. **Freshdesk webhooks are processed immediately.** `/freshdesk/webhook` persists the ticket **and runs the matcher inside the request** — the race is scored the instant a ticket is created, not on the next 60s poll. _Enforced by `test_webhook_immediate_save_and_match`._
 
-4. **Matching is a metadata / time / keyword / semantic hybrid — never LLM-only.** Confidence combines country-tag overlap, time proximity, bilingual financial-keyword overlap, and content-word ('semantic') overlap. A model hallucination alone can't fabricate or destroy a match. _See `app/freshdesk/matcher.py::calculate_match_confidence`._
+4. **Matching is a metadata / time / keyword / semantic hybrid — never LLM-only, and fully explained.** Every match records a structured, auditable `matched_by` (`["business_action", "country", "provider", "time_window", "keyword_match"]`) and `match_reasons` (the matched country/provider, the multilingual `keyword_overlap`, the detected `keyword_language` of `en`/`es`/`mixed`, and the signed `time_delta_seconds`). Keyword groups are organised by meaning across languages, so the label stays generic while the language is reported, not hardcoded. A model hallucination alone can't fabricate or destroy a match. _See `app/freshdesk/matcher.py::explain_match` and `app/taxonomy.py`._
 
-5. **Anomaly detection catches silent business degradation before users complain.** Z-score volume spikes, elevated failure rates, stuck/pending rates, and latency regressions trip an alert even when no single error looks severe — and critical money-flows alert on tiny samples. _See `app/incidents/anomaly.py`._
+5. **Each incident describes itself without the LLM.** Incidents carry structured metadata — `service`, `endpoint`, `route`, `business_action` (e.g. `withdrawal_failed`), `http_status`, `exception_type`, `primary_country`, `provider`, `platform`, `payment_method`, `normalized_keywords` — so the matcher and a human auditor can answer *what / where / who* from columns, not prose.
 
-6. **The judge audit endpoint proves wins transparently.** `GET /dashboard/audit` returns, per incident, the full lifecycle timeline, the benchmark timestamp, the matched ticket with signed delta, and the **immutable** audit-log trail — **including losses and failed notifications**. Nothing is hidden.
+6. **Every recurrence is its own benchmark race.** `fingerprint` is no longer globally unique; a partial unique index allows only **one open incident per fingerprint**. A resolved/false-positive fingerprint that reappears becomes a **new incident row** with a clean id, `first_seen`, alert timestamp, and Freshdesk comparison — so recurrences never mix histories. _Enforced by `tests/test_fingerprint_recurrence.py`._
+
+7. **PII never lands in the database, Slack, the LLM, or logs.** User/account ids are stored as salted one-way hashes (`affected_user_hashes`, never `affected_user_ids`); emails are hashed; raw webhook payloads are scrubbed (ids hashed, emails/secrets/phones masked) before the forensic copy is persisted. _Enforced by `tests/test_pii_hashing.py`._
+
+8. **Anomaly detection catches silent business degradation before users complain.** Z-score volume spikes, elevated failure rates, stuck/pending rates, and latency regressions trip an alert even when no single error looks severe — and critical money-flows alert on tiny samples. _See `app/incidents/anomaly.py`._
+
+9. **The judge audit endpoint proves wins transparently — and shows where it lost.** `GET /dashboard/audit` returns, per incident, the full lifecycle timeline, structured metadata, the benchmark timestamp, the matched ticket with signed delta + `matched_by`/`match_reasons`, and the **immutable** audit-log trail. `GET /dashboard/summary` adds honest counters: **p90 lead time**, **false positives**, **unmatched Freshdesk tickets**, and **detected-but-delivery-failed** — losses and gaps are surfaced, never hidden. The official rule stays strict: `agent_alert_timestamp < freshdesk_ticket_created_at`.
 
 ---
 
@@ -193,18 +199,24 @@ docker-compose up --build
 # API docs:  http://localhost:8000/docs
 # Dashboard: http://localhost:8501
 
-# 4. Run the demo simulation
+# 4. Prove a WIN end-to-end with no cloud services (offline)
+make demo-judge        # runs the real pipeline on SQLite + a fake delivered alert
+
+# 5. Or run the live HTTP demo against a running API
 python simulate_demo.py
 ```
 
-### Running the tests
+### One-command workflows (Makefile)
 
 ```bash
-pip install -r requirements.txt
-pytest -q          # full suite (fast, in-memory SQLite — no Postgres/Redis needed)
+make install      # pip install -r requirements.txt
+make test         # full suite (fast, in-memory SQLite — no Postgres/Redis needed)
+make migrate      # alembic upgrade head (needs Postgres)
+make demo-judge   # offline end-to-end proof of a WIN, read back from the audit endpoint
+make up           # docker-compose up --build (full stack)
 ```
 
-The suite proves the winning invariants directly: alert-before-LLM, timestamp-only-after-delivery, Slack retry, anomaly detection, hybrid match confidence + win/loss logic, immediate Freshdesk ingest, state-machine transitions, fingerprint recurrence, and PII redaction.
+The suite proves the winning invariants directly: alert-before-LLM, timestamp-only-after-delivery, Slack retry, anomaly detection, **self-built rolling-baseline detection (MetricBucket)**, **multichannel fallback (Slack→PagerDuty→email)**, **structured match explanations (`matched_by`/`match_reasons`, multilingual)**, immediate Freshdesk ingest, state-machine transitions, **recurrence-as-a-new-race + the partial unique index**, **PII hashing (no raw user ids stored)**, **honesty metrics (p90 / false-positives / unmatched / detected-but-undelivered)**, and PII redaction.
 
 ### Running the app locally (without Docker)
 
@@ -348,6 +360,18 @@ Some degradations never throw a loud error. `app/incidents/anomaly.py` adds pure
 
 Critical money-flows use `ANOMALY_CRITICAL_MIN_SAMPLE_SIZE` so even a handful of failed withdrawals is enough to fire.
 
+### Self-built rolling baselines (MetricBucket)
+
+The agent doesn't wait for a producer to compute rates — it builds its **own** per-minute, per-dimension metrics from the event stream in the `metric_buckets` table, then compares a recent window to its **own preceding baseline** per `country / provider / platform / payment_method`. This is what catches *silent* degradation:
+
+> `withdrawal` success rate in `MX` dropped **97% → 71%** · `deposit` p95 latency **3.8×** baseline · pending `transfer` rate **5σ** above normal
+
+The statistics reuse the pure detectors above (`app/incidents/metrics.py` builds the series and calls them). `GET /dashboard/metrics` exposes the live current-vs-baseline view and any active anomalies. Business actions recognised include `withdrawal`, `direct_withdraw`, `deposit`, `transfer`, `p2p`, `payment`, `balance`, `login`, `signup`, `virtual_account`, and `virtual_card` (see `app/taxonomy.py`).
+
+### Multichannel delivery (Slack → PagerDuty → email)
+
+For a 30-day trial a single channel isn't enough. Delivery falls through **Slack → PagerDuty → email**, and the **first channel that confirms delivery locks the official benchmark timestamp**. The delivering channel is recorded on the incident (`notification_channel`) and the full per-channel attempt log goes to the immutable audit trail — so a Slack outage doesn't cost the agent a win it could have delivered elsewhere. _See `app/alerts/channels.py` and `tests/test_fallback_delivery.py`._
+
 ---
 
 ## Key Design Decisions
@@ -403,7 +427,7 @@ earlybird/
 │   ├── main.py                  # FastAPI entry point
 │   ├── config.py                # All settings
 │   ├── database.py              # Async SQLAlchemy
-│   ├── models.py                # Full DB schema (7 tables)
+│   ├── models.py                # Full DB schema (incidents, events, matches, audit, metric_buckets, …)
 │   ├── celery_app.py            # Celery + Beat config
 │   ├── webhooks/
 │   │   ├── sentry.py            # Sentry webhook receiver
@@ -411,15 +435,18 @@ earlybird/
 │   │   └── product_events.py    # Custom product events
 │   ├── normalizers/
 │   │   └── base.py              # Sentry/Datadog/Product normalizer
+│   ├── taxonomy.py              # Business actions + multilingual keyword groups
 │   ├── incidents/
 │   │   ├── scoring.py           # Business criticality matrix
-│   │   ├── anomaly.py           # Z-score / failure / pending / latency detectors
-│   │   ├── alerting.py          # Fast-path orchestrator (deliver → enrich)
+│   │   ├── anomaly.py           # Pure z-score / failure / pending / latency detectors
+│   │   ├── metrics.py           # MetricBucket aggregation + rolling-baseline detection
+│   │   ├── alerting.py          # Fast-path orchestrator (deliver → enrich; multichannel)
 │   │   └── service.py           # Incident state machine + lifecycle writes
 │   ├── llm/
 │   │   └── analyst.py           # Claude Haiku integration
 │   ├── alerts/
-│   │   └── slack.py             # Two-phase Block Kit alerts (immediate + thread)
+│   │   ├── slack.py             # Two-phase Block Kit alerts (immediate + thread)
+│   │   └── channels.py          # PagerDuty + email fallback channels
 │   ├── freshdesk/
 │   │   ├── client.py            # Freshdesk API client
 │   │   ├── matcher.py           # Hybrid match confidence + win/loss logic
@@ -454,6 +481,7 @@ earlybird/
 | GET | `/dashboard/summary` | Win rate and lead time metrics (incl. failed notifications) |
 | GET | `/dashboard/incidents` | Full incident comparison log (with lifecycle timestamps) |
 | GET | `/dashboard/audit` | **Judge audit** — per-incident lifecycle, deltas & immutable trail |
+| GET | `/dashboard/metrics` | Self-built rolling baselines — current vs baseline rates + live anomalies |
 | GET | `/dashboard/win-rate` | Single win rate metric |
 | GET | `/health` | Health check |
 | GET | `/docs` | Interactive API docs |
