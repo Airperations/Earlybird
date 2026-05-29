@@ -39,28 +39,51 @@ class NormalizedEventSchema:
 
 
 def normalize_sentry(payload: dict) -> NormalizedEventSchema:
-    """Parse a Sentry issue webhook payload."""
-    event = payload.get("event", {})
-    request_data = event.get("request", {})
-    tags = {t[0]: t[1] for t in event.get("tags", []) if len(t) == 2}
+    """Parse a Sentry issue/error webhook payload.
 
-    url = request_data.get("url", "")
+    Tolerant of the two tag shapes Sentry emits in the wild: the issue-webhook
+    list of ``[key, value]`` pairs and the dict form some integrations send.
+    """
+    event = payload.get("event") if isinstance(payload, dict) else None
+    event = event if isinstance(event, dict) else {}
+    request_data = event.get("request") if isinstance(event.get("request"), dict) else {}
+    tags = _parse_tags(event.get("tags"))
+
+    contexts = event.get("contexts") if isinstance(event.get("contexts"), dict) else {}
+    response_ctx = contexts.get("response") if isinstance(contexts.get("response"), dict) else {}
+
+    url = request_data.get("url", "") or ""
     endpoint = _extract_endpoint(url)
     http_status = _safe_int(
-        event.get("contexts", {}).get("response", {}).get("status_code")
+        response_ctx.get("status_code")
         or tags.get("http.status_code")
+        or tags.get("http_status_code")
+        or request_data.get("status_code")
     )
     exception_type = None
-    message = event.get("message") or event.get("title", "")
+    # `title` and `culprit` are useful human context; fall back through them.
+    message = event.get("message") or event.get("title") or event.get("culprit", "")
 
-    exceptions = event.get("exception", {}).get("values", [])
-    if exceptions:
+    exception = event.get("exception") if isinstance(event.get("exception"), dict) else {}
+    exceptions = exception.get("values") if isinstance(exception.get("values"), list) else []
+    if exceptions and isinstance(exceptions[0], dict):
         exc = exceptions[0]
         exception_type = exc.get("type")
         message = exc.get("value") or message
 
+    service = payload.get("project_slug") or payload.get("project") or "unknown"
+    # Environment can live at event-level or in tags depending on SDK/integration.
+    environment = event.get("environment") or tags.get("environment") or "production"
+    # Prefer an explicit user id; fall back to a username/email so distinct
+    # affected users are still counted (the value is hashed downstream, never
+    # persisted raw — see app.redaction / service.save_normalized_event).
+    user = event.get("user") if isinstance(event.get("user"), dict) else {}
+    user_id = user.get("id") or user.get("username") or user.get("email")
+    geo = user.get("geo") if isinstance(user.get("geo"), dict) else {}
+    country = tags.get("country_code") or tags.get("country") or geo.get("country_code")
+
     fingerprint = _build_fingerprint(
-        service=payload.get("project_slug", "unknown"),
+        service=service,
         endpoint=endpoint,
         http_status=http_status,
         exception_type=exception_type,
@@ -68,20 +91,20 @@ def normalize_sentry(payload: dict) -> NormalizedEventSchema:
 
     return NormalizedEventSchema(
         source="sentry",
-        service=payload.get("project_slug", "unknown"),
-        environment=tags.get("environment", "production"),
+        service=service,
+        environment=environment,
         endpoint=endpoint,
         url=url,
         http_status=http_status,
         exception_type=exception_type,
         message=message,
-        user_id=event.get("user", {}).get("id"),
-        country=tags.get("country_code"),
+        user_id=user_id,
+        country=country,
         platform=event.get("platform"),
-        release=event.get("release"),
+        release=event.get("release") or tags.get("release"),
         fingerprint=fingerprint,
         raw_payload=payload,
-        event_timestamp=_parse_iso(event.get("timestamp")),
+        event_timestamp=_parse_iso(event.get("timestamp") or payload.get("timestamp")),
         provider=tags.get("provider"),
         payment_method=tags.get("payment_method"),
         business_action=derive_business_action(endpoint, http_status, exception_type),
@@ -89,39 +112,64 @@ def normalize_sentry(payload: dict) -> NormalizedEventSchema:
 
 
 def normalize_datadog(payload: dict) -> NormalizedEventSchema:
-    """Parse a Datadog monitor alert webhook payload."""
-    alert_title = payload.get("alert_title", "")
-    url = payload.get("url", "")
-    endpoint = _extract_endpoint(url)
-    tags_list = payload.get("tags", "").split(",") if payload.get("tags") else []
-    tags = dict(t.split(":", 1) for t in tags_list if ":" in t)
+    """Parse a Datadog monitor alert / custom webhook payload.
+
+    Datadog tags reach us in three shapes depending on how the webhook is wired:
+      • a comma string         "service:payments-api,country:MX,provider:stripe"
+      • a list of "k:v" strings ["service:payments-api", "country:MX"]
+      • a JSON object          {"service": "payments-api", "country": "MX"}
+    A *custom* webhook payload (recommended) can additionally send first-class
+    ``url`` / ``endpoint`` / ``business_action`` / ``service`` / ``env`` fields.
+    """
+    tags = _parse_tags(payload.get("tags"))
+
+    # Title/message fall back across the standard monitor fields and a custom one.
+    message = (
+        payload.get("title")
+        or payload.get("alert_title")
+        or payload.get("message")
+        or payload.get("event_title")
+        or ""
+    )
+    url = payload.get("url", "") or ""
+    endpoint = _extract_endpoint(url) or payload.get("endpoint", "")
+    service = payload.get("service") or tags.get("service") or "unknown"
+    http_status = _safe_int(payload.get("http_status") or tags.get("http_status_code"))
+    # alert_type / alert_status describe the monitor transition (error / warning…).
+    exception_type = payload.get("alert_type") or payload.get("alert_status")
+
+    business_action = (
+        payload.get("business_action")
+        or tags.get("business_action")
+        or derive_business_action(endpoint, http_status, exception_type)
+    )
 
     fingerprint = _build_fingerprint(
-        service=tags.get("service", "unknown"),
+        service=service,
         endpoint=endpoint,
-        http_status=None,
-        exception_type=payload.get("alert_type"),
+        http_status=http_status,
+        exception_type=exception_type,
     )
 
     return NormalizedEventSchema(
         source="datadog",
-        service=tags.get("service", "unknown"),
-        environment=tags.get("env", "production"),
+        service=service,
+        environment=payload.get("env") or tags.get("env") or "production",
         endpoint=endpoint,
         url=url,
-        http_status=None,
-        exception_type=payload.get("alert_type"),
-        message=alert_title,
+        http_status=http_status,
+        exception_type=exception_type,
+        message=message,
         user_id=None,
-        country=tags.get("country"),
-        platform=tags.get("platform"),
-        release=tags.get("version"),
+        country=tags.get("country") or payload.get("country"),
+        platform=tags.get("platform") or payload.get("platform"),
+        release=tags.get("version") or payload.get("version"),
         fingerprint=fingerprint,
         raw_payload=payload,
-        event_timestamp=_parse_iso(payload.get("date")),
-        provider=tags.get("provider"),
-        payment_method=tags.get("payment_method"),
-        business_action=derive_business_action(endpoint, None, payload.get("alert_type")),
+        event_timestamp=_parse_iso(payload.get("timestamp") or payload.get("date")),
+        provider=tags.get("provider") or payload.get("provider"),
+        payment_method=tags.get("payment_method") or payload.get("payment_method"),
+        business_action=business_action,
     )
 
 
@@ -171,6 +219,41 @@ def normalize(source: str, payload: dict) -> NormalizedEventSchema:
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
+
+def _parse_tags(raw) -> dict:
+    """
+    Normalize the many tag shapes Sentry/Datadog emit into a flat ``{key: value}``
+    dict. Never raises on an unexpected shape — unknown forms yield ``{}`` so a
+    partial payload degrades to "no tags" instead of a 500.
+
+    Supported inputs:
+      • dict                       {"service": "payments-api", "country": "MX"}
+      • comma string               "service:payments-api,country:MX"
+      • list of "k:v" strings      ["service:payments-api", "country:MX"]
+      • list of [k, v] pairs       [["environment", "production"], ...]  (Sentry)
+      • any mix of the above
+    """
+    out: dict = {}
+    if not raw:
+        return out
+
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            out[str(k)] = "" if v is None else str(v)
+        return out
+
+    items = raw.split(",") if isinstance(raw, str) else raw
+    if not isinstance(items, (list, tuple)):
+        return out
+
+    for item in items:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out[str(item[0])] = "" if item[1] is None else str(item[1])
+        elif isinstance(item, str) and ":" in item:
+            k, v = item.split(":", 1)
+            out[k.strip()] = v.strip()
+    return out
+
 
 def _extract_endpoint(url: str) -> str:
     """Extract the base endpoint path, stripping scheme/host, query params and IDs."""

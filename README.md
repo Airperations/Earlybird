@@ -407,6 +407,116 @@ No access to production systems needed beyond adding a webhook URL.
 
 ---
 
+## Source compatibility: Sentry and Datadog
+
+Earlybird ships with **dedicated, tested receivers** for both Sentry and Datadog.
+Compatibility is demonstrated end-to-end in `tests/test_source_compatibility.py`
+(normalize → incident → metric buckets → Freshdesk match → alert), not asserted
+from this README.
+
+| Source  | Status | What works | Caveat |
+|---------|--------|------------|--------|
+| **Sentry**  | ✅ Fully supported (issue/error webhook) | service, endpoint, http_status, exception type/value, country, provider, payment_method, platform, release, environment, user (hashed), business_action, timestamp | Error-only stream → supports failure/volume/latency detection. True *success-rate* baselines need success events or metric counts. |
+| **Datadog** | ✅ Fully supported (custom webhook recommended) | tags as **list / dict / string**, service, env, country, provider, payment_method, platform, alert_type/status, business_action, aggregate `metrics` counts fed into MetricBuckets | A bare monitor with no URL/`endpoint`/`business_action` tag won't infer a business action — the **custom payload below is recommended**. |
+
+### Endpoints & required headers
+
+```
+POST  https://<your-server>/webhooks/sentry/
+POST  https://<your-server>/webhooks/datadog/
+```
+
+| Source  | Auth header (when a secret is configured) |
+|---------|-------------------------------------------|
+| Sentry  | `sentry-hook-signature: <HMAC-SHA256 of the raw body>` (set `SENTRY_WEBHOOK_SECRET`) |
+| Datadog | `x-webhook-token: <DATADOG_WEBHOOK_SECRET>` |
+
+Both endpoints also honour optional replay-protection headers `x-webhook-timestamp`
+and `x-webhook-nonce`. If no secret is set, the endpoint is open (logged as a
+warning) so local dev keeps working. Unknown or partial payloads never 500:
+malformed JSON returns `400`, and an unrecognized shape normalizes to safe
+defaults (`service="unknown"`, no `business_action`) and is processed
+best-effort by the worker.
+
+### Example Sentry payload
+
+```json
+{
+  "project_slug": "payments-api",
+  "event": {
+    "title": "GatewayTimeout: upstream did not respond",
+    "level": "error",
+    "platform": "python",
+    "environment": "production",
+    "timestamp": "2026-05-29T18:43:01Z",
+    "tags": [["country_code", "MX"], ["http.status_code", "502"],
+             ["provider", "stripe"], ["payment_method", "card"]],
+    "request": {"url": "https://api.airdrive.com/api/v1/withdraw/confirm", "method": "POST"},
+    "exception": {"values": [{"type": "GatewayTimeout", "value": "no response in 30s"}]},
+    "user": {"id": "user_mx_4821"}
+  }
+}
+```
+
+### Example Datadog custom-webhook payload (recommended)
+
+A custom payload lets Datadog hand Earlybird the business context and the
+aggregate counts that drive the rolling baselines:
+
+```json
+{
+  "alert_type": "error",
+  "alert_status": "Triggered",
+  "title": "[Triggered] Withdrawal success rate dropped in MX",
+  "url": "https://api.airdrive.com/api/v1/withdraw/confirm",
+  "timestamp": "2026-05-29T18:43:05Z",
+  "tags": ["service:payments-api", "env:production", "country:MX",
+           "provider:stripe", "payment_method:card", "platform:ios"],
+  "metrics": {
+    "total_count": 200, "success_count": 118,
+    "failure_count": 78, "pending_count": 4, "p95_latency_ms": 4200
+  }
+}
+```
+
+`tags` may be a list of `key:value` strings (above), a JSON object
+(`{"service": "payments-api", ...}`), or a comma string
+(`"service:payments-api,country:MX"`) — all three are normalized identically.
+
+### Notes (judge-safe truth)
+
+- **Datadog custom payload is recommended.** A bare standard monitor often lacks a
+  URL/endpoint, so no `business_action` can be inferred and `metrics` counts won't
+  be present. Include a `url`/`endpoint`/`business_action` and a `metrics` block.
+- **Success-rate baselines need success signal.** The "97% → 71%" success-rate
+  drop requires success events or metric `success_count`. An error-only Sentry
+  stream cannot establish a success-rate baseline by itself.
+- **Error-only sources still detect failure / volume / latency.** Sentry errors
+  (and Datadog `failure_count`/`p95_latency_ms`) feed failure-rate, volume-spike,
+  and latency-regression detection without any success signal.
+
+### Try it locally with curl
+
+```bash
+# 1. Start the API (Postgres + Redis must be up — `make up` brings the full stack)
+uvicorn app.main:app --reload --port 8000
+
+# 2. Send a Sentry event (no secret set → open endpoint in dev)
+curl -sS -X POST http://localhost:8000/webhooks/sentry/ \
+  -H 'Content-Type: application/json' \
+  --data @tests/fixtures/sentry_issue_payload.json
+
+# 3. Send a Datadog custom-webhook event
+curl -sS -X POST http://localhost:8000/webhooks/datadog/ \
+  -H 'Content-Type: application/json' \
+  --data @tests/fixtures/datadog_monitor_payload.json
+
+# Each returns {"status":"accepted","received_at":"…"} immediately and processes
+# async. Watch results at GET /dashboard/incidents and /dashboard/audit.
+```
+
+---
+
 ## Evidence Table
 
 ```

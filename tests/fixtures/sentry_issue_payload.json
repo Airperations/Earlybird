@@ -1,0 +1,41 @@
+{
+  "action": "created",
+  "project_slug": "payments-api",
+  "event": {
+    "event_id": "fbe8a9d2c1f04e6b9a1c0d3e2f5a6b7c",
+    "title": "GatewayTimeout: upstream did not respond",
+    "culprit": "app.payments.withdraw in confirm_withdrawal",
+    "level": "error",
+    "platform": "python",
+    "release": "payments-api@1.42.0",
+    "environment": "production",
+    "timestamp": "2026-05-29T18:43:01Z",
+    "message": "Withdrawal confirmation timed out",
+    "tags": [
+      ["environment", "production"],
+      ["country_code", "MX"],
+      ["http.status_code", "502"],
+      ["provider", "stripe"],
+      ["payment_method", "card"]
+    ],
+    "request": {
+      "url": "https://api.airdrive.com/api/v1/withdraw/confirm",
+      "method": "POST"
+    },
+    "exception": {
+      "values": [
+        {
+          "type": "GatewayTimeout",
+          "value": "Upstream payment provider did not respond within 30s for user victim@example.com"
+        }
+      ]
+    },
+    "user": {
+      "id": "user_mx_4821",
+      "email": "victim@example.com"
+    },
+    "contexts": {
+      "response": {"status_code": 502}
+    }
+  }
+}
