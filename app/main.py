@@ -19,6 +19,7 @@ from app.database import engine, Base, get_db
 from app.webhooks import sentry, datadog, product_events
 from app.freshdesk import routes as freshdesk_routes
 from app.dashboard import routes as dashboard_routes
+from app.dashboard import visual as dashboard_visual
 from app.incidents import service as incident_service
 
 # Configure logging
@@ -100,6 +101,9 @@ app.include_router(datadog.router, prefix="/webhooks/datadog", tags=["Webhooks"]
 app.include_router(product_events.router, prefix="/events", tags=["Product Events"])
 app.include_router(freshdesk_routes.router, prefix="/freshdesk", tags=["Freshdesk"])
 app.include_router(dashboard_routes.router, prefix="/dashboard", tags=["Dashboard"])
+# Visual dashboard (HTML + consolidated JSON). Separate router so /ui and /data
+# can accept the key via header OR ?key= query param for browser access.
+app.include_router(dashboard_visual.router, prefix="/dashboard", tags=["Dashboard"])
 
 
 if __name__ == "__main__":
