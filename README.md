@@ -172,7 +172,9 @@ DEDUP_WINDOW_MINUTES=30
   ```bash
   alembic upgrade head
   ```
-- **Start Command** (only serves traffic):
+- **Start Command** (only serves traffic). Use the plain form — Railway substitutes
+  `$PORT` itself, so no `sh -c` wrapper and no quotes (quotes break Railway's command
+  parser; the `${VAR:-default}` syntax is also unsupported):
   ```bash
   uvicorn app.main:app --host 0.0.0.0 --port $PORT
   ```
