@@ -149,9 +149,17 @@ async def _process(source: str, payload: dict, received_at_iso: str):
         )
 
         # ── Step 9: Mark incident as alerted (THE BOUNTY TIMESTAMP) ──────────
+        # Persist the SAME timestamp captured in Step 8 (before LLM/Slack), so the
+        # DB value used by the matcher matches what was shown in the Slack alert.
         title = llm_summary.get("title") if llm_summary else None
         await incident_service.mark_incident_alerted(
-            db, incident, slack_msg_id, llm_summary, title
+            db,
+            incident,
+            slack_msg_id,
+            llm_summary,
+            title,
+            alert_timestamp=alert_timestamp,
+            slack_delivered=slack_msg_id is not None,
         )
 
         raw_event.processed = True

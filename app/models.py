@@ -76,6 +76,7 @@ class Incident(Base):
     first_seen_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     last_seen_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     affected_users_count = Column(Integer, default=0)
+    affected_user_ids = Column(JSONB, default=list)   # distinct user ids seen for this incident
     event_count = Column(Integer, default=1)
     countries = Column(JSONB, default=list)
 

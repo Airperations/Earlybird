@@ -166,7 +166,7 @@ DEDUP_WINDOW_MINUTES=30
 
 **API service** → Settings → Start Command:
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
+alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
 **Worker service** (new GitHub deploy from same repo) → Start Command:
@@ -202,7 +202,7 @@ Run `python simulate_demo.py` to see the full pipeline in action:
 
 1. A Sentry webhook fires (withdrawal error, Mexico, HTTP 502)
 2. Agent captures timestamp immediately
-3. Celery worker normalizes and scores the event (score: ~150 → Critical)
+3. Celery worker normalizes and scores the event (score: 125 → Critical)
 4. Claude Haiku generates an incident summary
 5. Slack alert sent with `agent_alert_timestamp` locked
 6. A Freshdesk ticket arrives 3 minutes later
@@ -231,7 +231,7 @@ Each incident is scored across 6 dimensions:
 ## Key Design Decisions
 
 **Why Redis + Celery instead of FastAPI BackgroundTasks?**
-For a 30-day production trial, task durability matters. If the server restarts, BackgroundTasks are lost. Celery with `acks_late=True` guarantees no event is dropped.
+For a 30-day production trial, task durability matters. If the server restarts, BackgroundTasks are lost. Celery with `acks_late=True` re-delivers in-flight events after a worker crash. (Events that fail all retries are logged as dropped — wiring a dead-letter queue is the next hardening step.)
 
 **Why Claude Haiku?**
 Fast (< 2s), cheap, and produces JSON reliably. The LLM only runs on high-confidence incidents — not on every error — so costs stay low.
@@ -275,7 +275,7 @@ earlybird/
 │   ├── main.py                  # FastAPI entry point
 │   ├── config.py                # All settings
 │   ├── database.py              # Async SQLAlchemy
-│   ├── models.py                # Full DB schema (6 tables)
+│   ├── models.py                # Full DB schema (7 tables)
 │   ├── celery_app.py            # Celery + Beat config
 │   ├── webhooks/
 │   │   ├── sentry.py            # Sentry webhook receiver

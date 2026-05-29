@@ -58,6 +58,14 @@ async def find_or_create_incident(
             countries.append(normalized.country)
             incident.countries = countries
 
+        # Track distinct affected users so the "affected_users" scoring tier is real.
+        if normalized.user_id:
+            users = list(incident.affected_user_ids or [])
+            if normalized.user_id not in users:
+                users.append(normalized.user_id)
+                incident.affected_user_ids = users
+                incident.affected_users_count = len(users)
+
         incident.updated_at = datetime.now(timezone.utc)
         logger.info(f"[INCIDENT] Updated existing incident {incident.id} (count={incident.event_count})")
     else:
@@ -70,6 +78,7 @@ async def find_or_create_incident(
             last_seen_at=datetime.now(timezone.utc),
             event_count=1,
             affected_users_count=1 if normalized.user_id else 0,
+            affected_user_ids=[normalized.user_id] if normalized.user_id else [],
             countries=[normalized.country] if normalized.country else [],
         )
         db.add(incident)
@@ -140,10 +149,20 @@ async def mark_incident_alerted(
     slack_message_id: Optional[str],
     llm_summary: Optional[dict],
     title: Optional[str],
+    alert_timestamp: datetime,
+    slack_delivered: bool,
 ):
-    """Mark incident as alerted — sets the KEY bounty timestamp."""
+    """
+    Mark incident as alerted — sets the KEY bounty timestamp.
+
+    `alert_timestamp` is captured ONCE in the worker (before the LLM/Slack calls)
+    and threaded through here so the value persisted to the DB matches the value
+    rendered in the Slack alert. `slack_delivered` records whether the channel
+    actually received the message, so a failed delivery is visible in the audit
+    trail instead of being indistinguishable from a real alert.
+    """
     incident.status = "alerted"
-    incident.agent_alert_timestamp = datetime.now(timezone.utc)
+    incident.agent_alert_timestamp = alert_timestamp
     incident.slack_message_id = slack_message_id
     incident.llm_summary = llm_summary
     incident.title = title
@@ -153,6 +172,7 @@ async def mark_incident_alerted(
         "agent_alert_timestamp": incident.agent_alert_timestamp.isoformat(),
         "severity": incident.severity,
         "score": incident.score,
+        "slack_delivered": slack_delivered,
     })
 
     logger.info(

@@ -13,15 +13,26 @@ from app.celery_app import celery_app
 from app.database import AsyncSessionLocal
 from app.models import FreshdeskTicket
 from app.freshdesk.client import freshdesk_client
-from app.freshdesk.matcher import match_incidents_to_freshdesk
+from app.freshdesk.matcher import match_incidents_to_freshdesk, normalize_tags
 
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="app.workers.freshdesk_sync.sync_freshdesk_tickets")
-def sync_freshdesk_tickets():
+@celery_app.task(
+    name="app.workers.freshdesk_sync.sync_freshdesk_tickets",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=30,
+)
+def sync_freshdesk_tickets(self):
     """Periodic task: fetch new Freshdesk tickets and run matcher."""
-    asyncio.run(_sync())
+    try:
+        asyncio.run(_sync())
+    except Exception as exc:
+        # Beat-triggered tasks don't retry by default; without this guard a single
+        # bad ticket/DB hiccup silently kills every sync cycle.
+        logger.error(f"[FRESHDESK SYNC] Sync failed: {exc}", exc_info=True)
+        raise self.retry(exc=exc)
 
 
 async def _sync():
@@ -55,8 +66,8 @@ async def _sync():
                     id=ticket_id,
                     subject=ticket.get("subject"),
                     description=ticket.get("description_text") or ticket.get("description"),
-                    requester_email=ticket.get("requester", {}).get("email"),
-                    tags=ticket.get("tags", []),
+                    requester_email=(ticket.get("requester") or {}).get("email"),
+                    tags=normalize_tags(ticket.get("tags")),
                     created_at=created_at,
                     raw_payload=ticket,
                 )

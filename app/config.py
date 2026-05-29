@@ -4,6 +4,7 @@ All settings loaded from environment variables.
 """
 
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from typing import Optional
 
 
@@ -46,6 +47,21 @@ class Settings(BaseSettings):
     # Freshdesk matching
     FRESHDESK_MATCH_WINDOW_HOURS: int = 24
     FRESHDESK_POLL_INTERVAL_SECONDS: int = 60
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _force_asyncpg(cls, v: str) -> str:
+        """
+        Railway/Heroku hand out `postgres://` or `postgresql://`. The async engine
+        in database.py requires the asyncpg driver, so normalize any plain Postgres
+        URL to `postgresql+asyncpg://`. A copy-pasted Railway connection string
+        then Just Works without a broken startup.
+        """
+        if v.startswith("postgres://"):
+            v = v.replace("postgres://", "postgresql://", 1)
+        if v.startswith("postgresql://"):
+            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
 
     class Config:
         env_file = ".env"

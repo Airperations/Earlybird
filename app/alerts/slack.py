@@ -164,7 +164,10 @@ def send_incident_alert(
         )
         response.raise_for_status()
         logger.info(f"[SLACK] Alert sent for incident {incident_id}")
-        return response.headers.get("X-Slack-Req-Timestamp")
+        # Slack incoming webhooks return body "ok" with no message-ts header, so
+        # fall back to a non-null sentinel. The caller only needs a truthy value
+        # to know delivery succeeded.
+        return response.headers.get("X-Slack-Req-Timestamp") or "ok"
     except requests.RequestException as e:
         logger.error(f"[SLACK] Failed to send alert: {e}")
         return None

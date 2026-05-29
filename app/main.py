@@ -6,6 +6,8 @@ Entry point for webhook ingestion and API endpoints.
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
+import redis.asyncio as aioredis
 import uvicorn
 import logging
 from datetime import datetime, timezone
@@ -41,20 +43,45 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database tables on startup."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """
+    Schema is managed by Alembic (`alembic upgrade head`), run as a deploy step
+    before this process starts — see Procfile / docker-compose. We no longer call
+    create_all here, because it cannot evolve an existing schema and masks drift.
+    """
     logger.info("✅ Earlybird started successfully")
 
 
 @app.get("/health")
 async def health():
+    """Liveness: the process is up. Cheap, no external dependencies."""
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/ready")
 async def ready():
-    return {"status": "ready", "version": "1.0.0"}
+    """Readiness: actually verify DB and Redis connectivity. 503 if either is down."""
+    checks = {}
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as e:
+        checks["db"] = f"fail: {e.__class__.__name__}"
+
+    redis_client = None
+    try:
+        redis_client = aioredis.from_url(settings.REDIS_URL)
+        await redis_client.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"fail: {e.__class__.__name__}"
+    finally:
+        if redis_client is not None:
+            await redis_client.aclose()
+
+    if not all(v == "ok" for v in checks.values()):
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks})
+    return {"status": "ready", "version": "1.0.0", "checks": checks}
 
 
 # Include routers

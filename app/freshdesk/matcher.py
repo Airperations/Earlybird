@@ -26,6 +26,25 @@ FINANCIAL_KEYWORDS = {
 }
 
 
+def normalize_tags(raw) -> List[str]:
+    """
+    Normalize Freshdesk tags to a list of upper-cased strings.
+
+    The real Freshdesk API v2 returns tags as plain strings (["MX", "withdrawal"]),
+    but webhook automations / the demo script send dicts ([{"name": "MX"}]). Handle
+    both so the matcher never crashes on `str.get(...)`.
+    """
+    out: List[str] = []
+    for t in (raw or []):
+        if isinstance(t, dict):
+            name = t.get("name", "")
+        else:
+            name = t
+        if name:
+            out.append(str(name).upper())
+    return out
+
+
 def _calculate_match_confidence(incident: Incident, ticket: dict) -> float:
     """
     Calculate how likely this ticket relates to this incident.
@@ -56,8 +75,8 @@ def _calculate_match_confidence(incident: Incident, ticket: dict) -> float:
         signals += 1
 
     # Signal 3: Country match (if ticket has tags)
-    incident_countries = set(incident.countries or [])
-    ticket_tags = [t.get("name", "").upper() for t in (ticket.get("tags") or [])]
+    incident_countries = {str(c).upper() for c in (incident.countries or [])}
+    ticket_tags = normalize_tags(ticket.get("tags"))
     if incident_countries & set(ticket_tags):
         score += 0.2
         signals += 1
