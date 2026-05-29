@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 
+from app.config import settings
 from app.database import get_db
+from app.webhooks.security import require_shared_secret, parse_json_or_400
 from app.workers.freshdesk_sync import sync_freshdesk_tickets
 
 router = APIRouter()
@@ -19,11 +21,13 @@ logger = logging.getLogger(__name__)
 async def freshdesk_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Real-time Freshdesk webhook on ticket creation.
-    Configure in Freshdesk: Admin > Automations > Webhooks > On Ticket Create
+    Configure in Freshdesk: Admin > Automations > Webhooks > On Ticket Create,
+    adding a custom header `x-webhook-token: <FRESHDESK_WEBHOOK_SECRET>`.
     This gives us instant comparison instead of waiting for polling.
     """
     received_at = datetime.now(timezone.utc)
-    payload = await request.json()
+    require_shared_secret(request, settings.FRESHDESK_WEBHOOK_SECRET, "freshdesk")
+    payload = await parse_json_or_400(request)
 
     logger.info(f"[FRESHDESK WEBHOOK] Ticket received at {received_at.isoformat()}: {payload.get('id')}")
 

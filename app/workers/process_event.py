@@ -18,6 +18,8 @@ import uuid
 import logging
 from datetime import datetime, timezone
 
+import redis
+
 from app.celery_app import celery_app
 from app.database import AsyncSessionLocal
 from app.models import RawEvent
@@ -29,6 +31,32 @@ from app.alerts.slack import send_incident_alert
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Synchronous Redis client used only for the cross-worker alert lock below.
+_redis = redis.Redis.from_url(settings.REDIS_URL)
+ALERT_LOCK_TTL_SECONDS = 300
+
+
+def _acquire_alert_lock(fingerprint: str) -> bool:
+    """
+    Best-effort distributed lock so a burst of identical events doesn't fire
+    multiple Slack alerts / LLM calls in the window before the first event's
+    status="alerted" commit lands. Fail-open: if Redis is unreachable we still
+    alert (a duplicate alert beats a missed one).
+    """
+    try:
+        return bool(_redis.set(f"earlybird:alert_lock:{fingerprint}", "1",
+                               nx=True, ex=ALERT_LOCK_TTL_SECONDS))
+    except Exception as e:
+        logger.warning(f"[WORKER] Alert lock unavailable ({e}); proceeding without it")
+        return True
+
+
+def _release_alert_lock(fingerprint: str) -> None:
+    try:
+        _redis.delete(f"earlybird:alert_lock:{fingerprint}")
+    except Exception:
+        pass
 
 
 @celery_app.task(
@@ -105,64 +133,78 @@ async def _process(source: str, payload: dict, received_at_iso: str):
             and not already_alerted
         )
 
+        # Cross-worker guard: during a burst, several events for the same
+        # fingerprint can pass the check before the first commits status="alerted".
+        # Only the lock holder proceeds to alert; the rest skip (no duplicate Slack).
+        if should_alert and not _acquire_alert_lock(normalized.fingerprint):
+            logger.info(f"[WORKER] Alert lock held for {normalized.fingerprint} — skipping duplicate alert")
+            should_alert = False
+
         if not should_alert:
             logger.info(f"[WORKER] Below threshold or already alerted — skipping alert")
             raw_event.processed = True
             await db.commit()
             return
 
-        # ── Step 7: Generate LLM summary ─────────────────────────────────────
-        llm_context = build_incident_context(
-            fingerprint=normalized.fingerprint,
-            service=normalized.service,
-            endpoint=normalized.endpoint,
-            http_status=normalized.http_status,
-            affected_users=incident.affected_users_count,
-            event_count=incident.event_count,
-            countries=list(incident.countries or []),
-            severity=scoring.severity,
-            score=scoring.total_score,
-            message=normalized.message,
-            exception_type=normalized.exception_type,
-            first_seen_at=incident.first_seen_at.isoformat(),
-            last_seen_at=incident.last_seen_at.isoformat(),
-        )
+        # Steps 7-9 hold the alert lock. If anything fails before the commit we
+        # release it so a Celery retry can re-attempt the alert (otherwise the lock
+        # would block re-alerting for its whole TTL and the incident would never alert).
+        try:
+            # ── Step 7: Generate LLM summary ─────────────────────────────────
+            llm_context = build_incident_context(
+                fingerprint=normalized.fingerprint,
+                service=normalized.service,
+                endpoint=normalized.endpoint,
+                http_status=normalized.http_status,
+                affected_users=incident.affected_users_count,
+                event_count=incident.event_count,
+                countries=list(incident.countries or []),
+                severity=scoring.severity,
+                score=scoring.total_score,
+                message=normalized.message,
+                exception_type=normalized.exception_type,
+                first_seen_at=incident.first_seen_at.isoformat(),
+                last_seen_at=incident.last_seen_at.isoformat(),
+            )
 
-        llm_summary = generate_incident_summary(llm_context)
+            llm_summary = generate_incident_summary(llm_context)
 
-        # ── Step 8: Send Slack alert ─────────────────────────────────────────
-        alert_timestamp = datetime.now(timezone.utc)
+            # ── Step 8: Send Slack alert ─────────────────────────────────────
+            alert_timestamp = datetime.now(timezone.utc)
 
-        slack_msg_id = send_incident_alert(
-            incident_id=str(incident.id),
-            fingerprint=normalized.fingerprint,
-            severity=scoring.severity,
-            score=scoring.total_score,
-            affected_users=incident.affected_users_count,
-            event_count=incident.event_count,
-            countries=list(incident.countries or []),
-            endpoint=normalized.endpoint,
-            service=normalized.service,
-            agent_alert_timestamp=alert_timestamp,
-            llm_summary=llm_summary,
-            suggested_owner=scoring.suggested_owner,
-        )
+            slack_msg_id = send_incident_alert(
+                incident_id=str(incident.id),
+                fingerprint=normalized.fingerprint,
+                severity=scoring.severity,
+                score=scoring.total_score,
+                affected_users=incident.affected_users_count,
+                event_count=incident.event_count,
+                countries=list(incident.countries or []),
+                endpoint=normalized.endpoint,
+                service=normalized.service,
+                agent_alert_timestamp=alert_timestamp,
+                llm_summary=llm_summary,
+                suggested_owner=scoring.suggested_owner,
+            )
 
-        # ── Step 9: Mark incident as alerted (THE BOUNTY TIMESTAMP) ──────────
-        # Persist the SAME timestamp captured in Step 8 (before LLM/Slack), so the
-        # DB value used by the matcher matches what was shown in the Slack alert.
-        title = llm_summary.get("title") if llm_summary else None
-        await incident_service.mark_incident_alerted(
-            db,
-            incident,
-            slack_msg_id,
-            llm_summary,
-            title,
-            alert_timestamp=alert_timestamp,
-            slack_delivered=slack_msg_id is not None,
-        )
+            # ── Step 9: Mark incident as alerted (THE BOUNTY TIMESTAMP) ──────
+            # Persist the SAME timestamp captured in Step 8 (before LLM/Slack), so
+            # the DB value used by the matcher matches what Slack showed.
+            title = llm_summary.get("title") if llm_summary else None
+            await incident_service.mark_incident_alerted(
+                db,
+                incident,
+                slack_msg_id,
+                llm_summary,
+                title,
+                alert_timestamp=alert_timestamp,
+                slack_delivered=slack_msg_id is not None,
+            )
 
-        raw_event.processed = True
-        await db.commit()
+            raw_event.processed = True
+            await db.commit()
+        except Exception:
+            _release_alert_lock(normalized.fingerprint)
+            raise
 
         logger.info(f"[WORKER] ✅ Pipeline complete for incident {incident.id}")

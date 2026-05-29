@@ -31,9 +31,11 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     LLM_MODEL: str = "claude-haiku-4-5-20251001"
 
-    # Webhook secrets (for signature validation)
+    # Webhook secrets (for signature / shared-secret validation)
     SENTRY_WEBHOOK_SECRET: Optional[str] = None
     DATADOG_WEBHOOK_SECRET: Optional[str] = None
+    PRODUCT_WEBHOOK_SECRET: Optional[str] = None
+    FRESHDESK_WEBHOOK_SECRET: Optional[str] = None
 
     # Scoring thresholds
     CRITICAL_SCORE_THRESHOLD: int = 100
