@@ -1,10 +1,14 @@
 # Earlybird — developer & judge entrypoints.
 # Everything a judge needs runs with one command and no cloud services.
 
+# Use the project virtualenv automatically when present, so `make test` /
+# `make demo-judge` work without manually activating it. Falls back to `python`.
+PYTHON := $(shell [ -x ./.venv/bin/python ] && echo ./.venv/bin/python || echo python)
+
 .PHONY: help install test migrate up down demo demo-judge
 
 help:
-	@echo "Earlybird make targets:"
+	@echo "Earlybird make targets (using PYTHON=$(PYTHON)):"
 	@echo "  make install     Install Python dependencies"
 	@echo "  make test        Run the full test suite (in-memory SQLite; no Postgres/Redis)"
 	@echo "  make migrate     Apply database migrations (alembic upgrade head; needs Postgres)"
@@ -14,13 +18,13 @@ help:
 	@echo "  make demo        HTTP demo against a running API (uvicorn must be up)"
 
 install:
-	pip install -r requirements.txt
+	$(PYTHON) -m pip install -r requirements.txt
 
 test:
-	pytest -q
+	$(PYTHON) -m pytest -q
 
 migrate:
-	alembic upgrade head
+	$(PYTHON) -m alembic upgrade head
 
 up:
 	docker-compose up --build
@@ -31,8 +35,8 @@ down:
 # Self-contained: runs the real pipeline on SQLite + a fake delivered alert and
 # prints a verifiable WIN read back from the judge audit endpoint.
 demo-judge:
-	python demo_judge.py
+	$(PYTHON) demo_judge.py
 
 # Hits a running API (uvicorn app.main:app) — for a live Slack/dashboard demo.
 demo:
-	python simulate_demo.py
+	$(PYTHON) simulate_demo.py
