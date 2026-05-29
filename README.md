@@ -1,12 +1,12 @@
 # 🛡️ Earlybird
 
-**Bounty 2 — Early Incident Detection & Freshdesk Benchmarking System**
+**Early Incident Detection & Support Benchmarking System**
 
-An autonomous agent that monitors every error and anomaly on the Airdrive platform, detects them before they become support tickets, and proves it with an immutable audit trail.
+An autonomous agent that monitors every error and anomaly on the Airtm platform, detects them before they become support tickets, and proves it with an immutable audit trail.
 
 ---
 
-## 🏆 Bounty Metric
+## 🏆 Success Metric
 
 > **Agent Win Rate ≥ 80% over a 30-day trial**
 >
@@ -33,7 +33,7 @@ Claude Haiku LLM — incident summary in <2s
         ↓
 Slack Alert ← AGENT ALERT TIMESTAMP LOCKED HERE
         ↓
-PostgreSQL Audit Log (immutable race evidence)
+PostgreSQL Audit Log (immutable evidence)
         ↓
 Freshdesk Comparator (polling + real-time webhook)
         ↓
@@ -64,6 +64,79 @@ python simulate_demo.py
 
 ---
 
+## 🚂 Deploy to Railway (Production — 24/7)
+
+Railway runs Earlybird in the cloud so it works even when your computer is off.
+
+### Step 1 — Create account
+Go to [railway.app](https://railway.app) → **Login with GitHub**
+
+### Step 2 — New project
+**New Project** → **Deploy from GitHub repo** → select `Earlybird`
+
+### Step 3 — Add databases
+Inside the project:
+- **+ New** → **Database** → **Add PostgreSQL**
+- **+ New** → **Database** → **Add Redis**
+
+Railway generates the connection URLs automatically.
+
+### Step 4 — Set environment variables
+Click your Earlybird service → **Variables** tab → add:
+
+```env
+APP_ENV=production
+DATABASE_URL=<copy from Railway PostgreSQL service>
+REDIS_URL=<copy from Railway Redis service>
+SLACK_WEBHOOK_URL=your_slack_webhook
+SLACK_ALERT_CHANNEL=#earlybird-alerts
+ANTHROPIC_API_KEY=your_key
+LLM_MODEL=claude-haiku-4-5-20251001
+FRESHDESK_DOMAIN=airtm.freshdesk.com
+FRESHDESK_API_KEY=your_key
+FRESHDESK_POLL_INTERVAL_SECONDS=60
+FRESHDESK_MATCH_WINDOW_HOURS=24
+CRITICAL_SCORE_THRESHOLD=100
+HIGH_SCORE_THRESHOLD=80
+MEDIUM_SCORE_THRESHOLD=60
+LOW_SCORE_THRESHOLD=40
+DEDUP_WINDOW_MINUTES=30
+```
+
+### Step 5 — Configure the 3 services
+
+**API service** → Settings → Start Command:
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+**Worker service** (new GitHub deploy from same repo) → Start Command:
+```bash
+celery -A app.celery_app worker --loglevel=info -Q events,freshdesk
+```
+
+**Beat service** (new GitHub deploy from same repo) → Start Command:
+```bash
+celery -A app.celery_app beat --loglevel=info
+```
+
+### Step 6 — Get your public URL
+API service → **Settings** → **Domains** → **Generate Domain**
+
+```
+https://earlybird-production.up.railway.app
+```
+
+### Step 7 — Configure these webhook URLs in your observability tools
+```
+Sentry:    https://earlybird-production.up.railway.app/webhooks/sentry/
+Datadog:   https://earlybird-production.up.railway.app/webhooks/datadog/
+Freshdesk: https://earlybird-production.up.railway.app/freshdesk/webhook
+Dashboard: https://earlybird-production.up.railway.app/dashboard/summary
+```
+
+---
+
 ## Demo Scenario
 
 Run `python simulate_demo.py` to see the full pipeline in action:
@@ -90,7 +163,7 @@ Each incident is scored across 6 dimensions:
 | Error velocity (10x growth) | +60 |
 | HTTP status (5xx, timeouts) | +35 |
 | Country concentration (LATAM key markets) | +20 |
-| No Freshdesk ticket yet | +20 |
+| No support ticket yet | +20 |
 
 **Thresholds:** `observe < 40 < low < 60 < medium < 80 < high < 100 < critical`
 
@@ -105,11 +178,11 @@ For a 30-day production trial, task durability matters. If the server restarts, 
 Fast (< 2s), cheap, and produces JSON reliably. The LLM only runs on high-confidence incidents — not on every error — so costs stay low.
 
 **Why the Freshdesk webhook endpoint?**
-Polling every 60s creates a worst-case 60s delay in registering losses. The `/freshdesk/webhook` endpoint lets Airdrive configure a real-time trigger so the race result is recorded the instant a ticket is created.
+Polling every 60s creates a worst-case 60s delay in registering results. The `/freshdesk/webhook` endpoint enables a real-time trigger so the comparison is recorded the instant a ticket is created.
 
 ---
 
-## Connecting to Airdrive's Stack
+## Connecting to Airtm's Stack
 
 The agent needs one of two things to receive real events:
 
@@ -123,7 +196,7 @@ No access to production systems needed beyond adding a webhook URL.
 
 ---
 
-## Evidence Table (what judges see)
+## Evidence Table
 
 ```
 Incident ID | Agent Alert  | Freshdesk Ticket | Lead Time | Outcome
@@ -163,7 +236,7 @@ earlybird/
 │   │   ├── matcher.py           # Race result calculator
 │   │   └── routes.py            # Freshdesk API endpoints
 │   ├── dashboard/
-│   │   └── routes.py            # Bounty metrics API
+│   │   └── routes.py            # Metrics API
 │   └── workers/
 │       ├── process_event.py     # Main Celery pipeline
 │       └── freshdesk_sync.py    # Periodic Freshdesk sync
@@ -188,8 +261,8 @@ earlybird/
 | POST | `/events/product` | Custom product events |
 | POST | `/freshdesk/webhook` | Real-time Freshdesk ticket notification |
 | POST | `/freshdesk/sync` | Manual sync trigger |
-| GET | `/dashboard/summary` | Bounty metrics (win rate, lead time) |
-| GET | `/dashboard/incidents` | Full incident race log |
+| GET | `/dashboard/summary` | Win rate and lead time metrics |
+| GET | `/dashboard/incidents` | Full incident comparison log |
 | GET | `/dashboard/win-rate` | Single win rate metric |
 | GET | `/health` | Health check |
 | GET | `/docs` | Interactive API docs |
