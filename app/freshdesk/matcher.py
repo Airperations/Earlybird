@@ -4,6 +4,7 @@ Compares agent alert timestamps vs Freshdesk ticket timestamps.
 This is the RACE RESULT calculator — the core bounty metric.
 """
 
+import re
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
@@ -45,43 +46,82 @@ def normalize_tags(raw) -> List[str]:
     return out
 
 
-def _calculate_match_confidence(incident: Incident, ticket: dict) -> float:
+_TOKEN = re.compile(r"[a-záéíóúñü]+", re.IGNORECASE)
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "have", "your", "you",
+    "are", "was", "but", "not", "can", "all", "any", "una", "los", "las", "del",
+    "que", "con", "por", "para", "una", "como", "esta", "este", "mi", "me",
+}
+
+
+def _incident_text(incident: Incident) -> str:
+    """All free text we know about an incident, lower-cased, for semantic overlap."""
+    summary = incident.llm_summary or {}
+    parts = [
+        incident.title or "",
+        incident.fingerprint or "",
+        summary.get("affected_area", ""),
+        summary.get("title", ""),
+        summary.get("summary", ""),
+    ]
+    return " ".join(p for p in parts if p).lower()
+
+
+def _semantic_overlap(incident: Incident, ticket_text: str) -> float:
     """
-    Calculate how likely this ticket relates to this incident.
-    Uses multiple signals for robustness.
-    Returns 0.0 to 1.0.
+    Lightweight token-overlap ('semantic') signal: Jaccard-style overlap of
+    content words between the incident's known text and the ticket text. Cheap,
+    dependency-free, and language-agnostic — a complement to, not a replacement
+    for, the metadata/time/keyword signals.
+    """
+    inc_tokens = {t for t in _TOKEN.findall(_incident_text(incident)) if len(t) > 3 and t not in _STOPWORDS}
+    tkt_tokens = {t for t in _TOKEN.findall(ticket_text) if len(t) > 3 and t not in _STOPWORDS}
+    if not inc_tokens or not tkt_tokens:
+        return 0.0
+    overlap = inc_tokens & tkt_tokens
+    if not overlap:
+        return 0.0
+    jaccard = len(overlap) / len(inc_tokens | tkt_tokens)
+    return min(0.2, jaccard * 0.6)
+
+
+def calculate_match_confidence(incident: Incident, ticket: dict) -> float:
+    """
+    Hybrid confidence that a ticket relates to an incident, in [0.0, 1.0].
+
+    Four independent signal families — deliberately NOT LLM-only, so a model
+    hallucination can't fabricate a match:
+      • metadata  — country/region tag overlap
+      • time      — proximity of ticket creation to the alert
+      • keyword   — financial/platform vocabulary overlap (EN + ES)
+      • semantic  — content-word overlap with the incident's known text
     """
     score = 0.0
-    signals = 0
 
     ticket_text = (
         (ticket.get("subject") or "") + " " +
         (ticket.get("description_text") or ticket.get("description") or "")
     ).lower()
 
-    # Signal 1: Endpoint keyword match
-    if incident.fingerprint:
-        endpoint_parts = [p for p in (incident.llm_summary or {}).get("affected_area", "").lower().split() if len(p) > 3]
-        for part in endpoint_parts:
-            if part in ticket_text:
-                score += 0.3
-                signals += 1
-                break
+    # Signal 1: Endpoint / affected-area keyword match
+    endpoint_parts = [p for p in (incident.llm_summary or {}).get("affected_area", "").lower().split() if len(p) > 3]
+    for part in endpoint_parts:
+        if part in ticket_text:
+            score += 0.3
+            break
 
-    # Signal 2: Financial keyword overlap
+    # Signal 2: Financial keyword overlap (keyword signal)
     ticket_keywords = set(ticket_text.split()) & FINANCIAL_KEYWORDS
     if ticket_keywords:
         score += min(0.2, len(ticket_keywords) * 0.05)
-        signals += 1
 
-    # Signal 3: Country match (if ticket has tags)
+    # Signal 3: Country match (metadata signal)
     incident_countries = {str(c).upper() for c in (incident.countries or [])}
     ticket_tags = normalize_tags(ticket.get("tags"))
     if incident_countries & set(ticket_tags):
         score += 0.2
-        signals += 1
 
-    # Signal 4: Time proximity
+    # Signal 4: Time proximity (time signal)
     ticket_created = _parse_freshdesk_time(ticket.get("created_at"))
     if ticket_created and incident.agent_alert_timestamp:
         delta = abs((ticket_created - incident.agent_alert_timestamp).total_seconds())
@@ -91,9 +131,31 @@ def _calculate_match_confidence(incident: Incident, ticket: dict) -> float:
             score += 0.2
         elif delta <= 3600:   # Within 1 hour
             score += 0.1
-        signals += 1
+
+    # Signal 5: Semantic content-word overlap
+    score += _semantic_overlap(incident, ticket_text)
 
     return min(1.0, score)
+
+
+# Backward-compatible alias (older callers / tests used the private name).
+_calculate_match_confidence = calculate_match_confidence
+
+
+def classify_outcome(delta_seconds: int, tie_grace_seconds: int = 30) -> str:
+    """
+    The benchmark win/loss rule, isolated and pure for testability.
+
+    delta = ticket_created - agent_alert_timestamp (seconds).
+      > 0                    → agent alerted first  → agent_won
+      <= -tie_grace_seconds  → ticket arrived first → agent_lost
+      otherwise              → effectively simultaneous → tie
+    """
+    if delta_seconds > 0:
+        return "agent_won"
+    if delta_seconds < -tie_grace_seconds:
+        return "agent_lost"
+    return "tie"
 
 
 async def match_incidents_to_freshdesk(
@@ -104,13 +166,19 @@ async def match_incidents_to_freshdesk(
     For each new Freshdesk ticket, find matching alerted incidents
     and record the race outcome.
     """
-    # Get all alerted incidents without a match yet
+    # Candidate incidents: a delivered alert (benchmark timestamp set) that is not
+    # already matched or closed. This includes both 'alerted' and 'enriched'.
     result = await db.execute(
         select(Incident)
-        .where(Incident.status == "alerted")
         .where(Incident.agent_alert_timestamp.isnot(None))
+        .where(Incident.status.not_in(["matched_to_freshdesk", "resolved", "ignored", "false_positive"]))
     )
     incidents = result.scalars().all()
+
+    # A ticket can arrive slightly before the alert (the agent can still win on a
+    # later event), so allow a small look-back plus the forward match window.
+    window_minutes = settings.FRESHDESK_MATCH_TIME_WINDOW_MINUTES
+    confidence_threshold = settings.FRESHDESK_MATCH_CONFIDENCE_THRESHOLD
 
     for ticket in tickets:
         ticket_created = _parse_freshdesk_time(ticket.get("created_at"))
@@ -131,22 +199,20 @@ async def match_incidents_to_freshdesk(
         best_confidence = 0.0
 
         for incident in incidents:
-            # Only match within time window
+            # Only match within the configurable time window.
             window_start = incident.agent_alert_timestamp - timedelta(minutes=10)
-            window_end = incident.agent_alert_timestamp + timedelta(
-                hours=settings.FRESHDESK_MATCH_WINDOW_HOURS
-            )
+            window_end = incident.agent_alert_timestamp + timedelta(minutes=window_minutes)
 
             if not (window_start <= ticket_created <= window_end):
                 continue
 
-            confidence = _calculate_match_confidence(incident, ticket)
+            confidence = calculate_match_confidence(incident, ticket)
             if confidence > best_confidence:
                 best_confidence = confidence
                 best_incident = incident
 
-        # Only record high-confidence matches
-        if best_incident and best_confidence >= 0.5:
+        # Only record matches above the configurable confidence threshold.
+        if best_incident and best_confidence >= confidence_threshold:
             await _record_match(db, best_incident, ticket, ticket_created, best_confidence)
 
 
@@ -161,14 +227,8 @@ async def _record_match(
     agent_ts = incident.agent_alert_timestamp
     delta_seconds = int((ticket_created - agent_ts).total_seconds())
 
-    # Positive delta = agent won (alerted before ticket)
-    # Negative delta = agent lost (ticket arrived before alert)
-    if delta_seconds > 0:
-        outcome = "agent_won"
-    elif delta_seconds < -30:   # 30s grace period for ties
-        outcome = "agent_lost"
-    else:
-        outcome = "tie"
+    # Positive delta = agent won (alerted before ticket); negative = agent lost.
+    outcome = classify_outcome(delta_seconds)
 
     match = IncidentFreshdeskMatch(
         id=uuid.uuid4(),
