@@ -1,6 +1,7 @@
 # Web Framework
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
+python-multipart==0.0.20  # form parsing for the dashboard browser login (POST /dashboard/login)
 
 # Database
 sqlalchemy==2.0.30
