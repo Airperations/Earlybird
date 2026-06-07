@@ -593,6 +593,7 @@ earlybird/
 | GET | `/dashboard/audit` | **Judge audit** — per-incident lifecycle, deltas & immutable trail |
 | GET | `/dashboard/metrics` | Self-built rolling baselines — current vs baseline rates + live anomalies |
 | GET | `/dashboard/win-rate` | Single win rate metric |
+| GET | `/dashboard/login` | **Browser login form** — exchanges the key for a session cookie |
 | GET | `/dashboard/ui` | **Visual dashboard** — browser HTML view (last 30 days) |
 | GET | `/dashboard/data` | Consolidated JSON powering the visual dashboard |
 | GET | `/health` | Health check |
@@ -607,25 +608,36 @@ product/agent metrics for the **last 30 days** (default range, no backfill
 required). It's plain server-rendered HTML with inline CSS — no React/Vue/Next,
 no external CSS/JS, no extra services to run.
 
-**Open it in a browser:**
+**Open it in a browser (recommended — login form):**
 
 ```
-https://earlybird-production-e5b5.up.railway.app/dashboard/ui?key=<DASHBOARD_API_KEY>
+https://earlybird-production-e5b5.up.railway.app/dashboard/login
 ```
 
-The consolidated JSON behind the page is at `/dashboard/data?key=<DASHBOARD_API_KEY>`.
+Enter the dashboard key once on the sign-in page. It's POSTed and exchanged for
+a signed, HttpOnly **session cookie**, so the key never lands in the URL, the
+browser history, server logs, or a shared screenshot. After signing in you're
+redirected to `/dashboard/ui`; **Sign out** (top-right) clears the cookie.
+Unauthenticated visits to `/dashboard/ui` now show this login form.
 
-**Authentication.** Both routes accept the key two ways:
+**Authentication.** Access is granted three ways, in order of preference:
 
-- the `x-dashboard-key` header (same as the existing JSON endpoints), or
-- a `?key=<DASHBOARD_API_KEY>` query parameter, for convenient browser access.
+1. **Browser login** — the session cookie set by `/dashboard/login` (recommended
+   for humans; keeps the key out of the URL).
+2. the `x-dashboard-key` header (same as the existing JSON endpoints), or
+3. a `?key=<DASHBOARD_API_KEY>` query parameter.
 
-> ⚠️ **Security note:** the query-param form is convenient but puts the key in
-> the URL. Do **not** share dashboard links containing the key in public
-> channels, tickets, or screenshots. The dashboard never displays or logs the
-> key, never exposes raw payloads, raw/hashed user identifiers, requester
-> emails, or webhook secrets. When `DASHBOARD_API_KEY` is unset the dashboard is
-> open (dev/demo only) — set a key before exposing it publicly.
+The header and `?key=` forms are kept for **debugging and scripted access** (e.g.
+`curl`). The consolidated JSON behind the page is at `/dashboard/data` and
+accepts the same three methods.
+
+> ⚠️ **Security note:** prefer the login form. The `?key=` query-param form is
+> convenient for debugging but puts the key in the URL — do **not** share
+> dashboard links containing the key in public channels, tickets, or
+> screenshots. The dashboard never displays or logs the key, never exposes raw
+> payloads, raw/hashed user identifiers, requester emails, or webhook secrets.
+> When `DASHBOARD_API_KEY` is unset the dashboard is open (dev/demo only) — set a
+> key before exposing it publicly.
 
 **What it shows:**
 

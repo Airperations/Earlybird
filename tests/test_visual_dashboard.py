@@ -174,6 +174,80 @@ async def test_does_not_expose_secrets_or_dashboard_key(client, db, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_login_form_renders(client):
+    """GET /dashboard/login serves the browser sign-in form (no key needed)."""
+    async with client:
+        resp = await client.get("/dashboard/login")
+    assert resp.status_code == 200
+    assert "<form" in resp.text
+    assert 'action="/dashboard/login"' in resp.text
+    assert 'name="key"' in resp.text
+
+
+@pytest.mark.asyncio
+async def test_login_with_correct_key_sets_cookie_and_redirects(client):
+    """POST with the right key sets an HttpOnly session cookie and redirects to /ui."""
+    async with client:
+        resp = await client.post("/dashboard/login", data={"key": KEY})
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/dashboard/ui"
+    set_cookie = resp.headers.get("set-cookie", "")
+    assert "eb_dashboard_session=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    # The raw key must never appear in the cookie value.
+    assert KEY not in set_cookie
+
+
+@pytest.mark.asyncio
+async def test_login_with_wrong_key_returns_401_no_cookie(client):
+    async with client:
+        resp = await client.post("/dashboard/login", data={"key": "wrong"})
+    assert resp.status_code == 401
+    assert "Invalid dashboard key" in resp.text
+    assert "set-cookie" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_session_cookie_grants_access_without_key_in_url(client):
+    """The login cookie alone opens /ui and /data — no ?key= or header needed."""
+    async with client:
+        # The client persists the Set-Cookie from login, like a real browser.
+        await client.post("/dashboard/login", data={"key": KEY})
+        ui = await client.get("/dashboard/ui")
+        data = await client.get("/dashboard/data")
+    assert ui.status_code == 200
+    assert "Earlybird Production Dashboard" in ui.text
+    assert data.status_code == 200
+    assert "cards" in data.json()
+
+
+@pytest.mark.asyncio
+async def test_ui_unauthorized_shows_login_form(client):
+    """An unauthenticated /ui still 401s, but now offers the login form."""
+    async with client:
+        resp = await client.get("/dashboard/ui")
+    assert resp.status_code == 401
+    assert 'action="/dashboard/login"' in resp.text
+
+
+@pytest.mark.asyncio
+async def test_logout_clears_cookie(client):
+    async with client:
+        resp = await client.get("/dashboard/logout")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/dashboard/login"
+    assert "eb_dashboard_session=" in resp.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_tampered_session_cookie_is_rejected(client):
+    async with client:
+        client.cookies.set("eb_dashboard_session", "deadbeef")
+        resp = await client.get("/dashboard/data")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_benchmark_and_sources_reflect_data(client, db):
     """A won incident + ticket + Datadog event should surface in the payload."""
     alert_ts = datetime.now(timezone.utc) - timedelta(days=1)

@@ -6,26 +6,33 @@ product/agent metrics. It renders server-side HTML with inline CSS (no React/Vue
 Next, no external CSS/JS) and a consolidated JSON sibling endpoint.
 
 Routes (mounted under /dashboard):
-    GET /dashboard/ui     → the visual HTML page
-    GET /dashboard/data   → the same data as a consolidated JSON payload
+    GET  /dashboard/login  → browser login form
+    POST /dashboard/login  → exchange the key for a signed session cookie
+    GET  /dashboard/logout → clear the session cookie
+    GET  /dashboard/ui     → the visual HTML page
+    GET  /dashboard/data   → the same data as a consolidated JSON payload
 
-These two routes intentionally live on their own router (NOT the header-only
-`require_dashboard_key` router) so they can also accept the key via a `?key=`
-query parameter for convenient browser access. The existing JSON endpoints
-(/dashboard/summary, /dashboard/metrics, /dashboard/audit) are untouched.
+These routes intentionally live on their own router (NOT the header-only
+`require_dashboard_key` router). The recommended way in is the login form: the
+key is POSTed once and exchanged for an HttpOnly session cookie, so it never
+lands in the URL or browser history. For debugging, the `x-dashboard-key`
+header and a `?key=` query parameter are still accepted. The existing JSON
+endpoints (/dashboard/summary, /dashboard/metrics, /dashboard/audit) are
+untouched.
 
 Privacy: this view never exposes raw payloads, raw user identifiers, hashed user
 references, requester emails, API keys, webhook secrets, or the dashboard key.
 """
 
+import hashlib
 import hmac
 import html
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import APIRouter, Cookie, Depends, Form, Header, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,7 +65,27 @@ PRODUCTION_LINKS = {
 OFFICIAL_WIN_RULE = "agent_alert_timestamp < freshdesk_ticket_created_at"
 
 
-# ─── Auth (header OR query param) ─────────────────────────────────────────────
+# ─── Auth (browser login cookie · header · query param) ───────────────────────
+
+# Name of the signed session cookie set by the browser login form. The cookie
+# never stores the key itself — only a key-derived token (see _session_token).
+SESSION_COOKIE_NAME = "eb_dashboard_session"
+
+# Fixed, non-secret salt mixed into the session token. Bumping the version
+# suffix invalidates every previously issued cookie.
+_SESSION_SALT = b"earlybird-dashboard-session-v1"
+
+
+def _session_token(expected_key: str) -> str:
+    """
+    Derive the opaque session-cookie value from the configured dashboard key.
+
+    It's an HMAC of a fixed salt keyed by DASHBOARD_API_KEY, so the cookie
+    proves the holder authenticated without ever embedding the key. Rotating the
+    key (or the salt version) invalidates all outstanding cookies automatically.
+    """
+    return hmac.new(expected_key.encode("utf-8"), _SESSION_SALT, hashlib.sha256).hexdigest()
+
 
 def _key_is_valid(provided: Optional[str]) -> bool:
     """
@@ -72,6 +99,35 @@ def _key_is_valid(provided: Optional[str]) -> bool:
         logger.warning("[DASHBOARD] DASHBOARD_API_KEY not set — visual dashboard is UNAUTHENTICATED")
         return True
     return bool(provided and hmac.compare_digest(provided, expected))
+
+
+def _is_authorized(provided: Optional[str], session_cookie: Optional[str]) -> bool:
+    """
+    A request is authorized if it carries the raw key (header or `?key=`, kept
+    for debugging) OR a valid browser-login session cookie. When no key is
+    configured, access is open (dev/demo) — _key_is_valid handles that branch.
+    """
+    expected = settings.DASHBOARD_API_KEY
+    if not expected:
+        return _key_is_valid(provided)
+    if provided and hmac.compare_digest(provided, expected):
+        return True
+    if session_cookie and hmac.compare_digest(session_cookie, _session_token(expected)):
+        return True
+    return False
+
+
+def _set_session_cookie(response, request: Request, expected_key: str) -> None:
+    """Issue the signed session cookie. Marked Secure when served over HTTPS."""
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=_session_token(expected_key),
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        max_age=60 * 60 * 12,  # 12h — judges/operators re-login next day.
+        path="/dashboard",
+    )
 
 
 # ─── Metric-bucket anomaly cells (reuses the live anomaly logic) ──────────────
@@ -397,14 +453,61 @@ def _as_aware(dt: datetime) -> datetime:
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
+@router.get("/login", response_class=HTMLResponse)
+async def dashboard_login_form(
+    request: Request,
+    error: Optional[str] = Query(default=None),
+    eb_dashboard_session: Optional[str] = Cookie(default=None),
+):
+    """
+    Browser login form. Lets an operator open the dashboard without ever putting
+    DASHBOARD_API_KEY in the URL — the key is POSTed once and exchanged for a
+    signed, HttpOnly session cookie. If already authenticated (or no key is
+    configured), bounce straight to the dashboard.
+    """
+    if _is_authorized(None, eb_dashboard_session):
+        return RedirectResponse(url="/dashboard/ui", status_code=303)
+    return HTMLResponse(_login_html(error=error), status_code=200)
+
+
+@router.post("/login")
+async def dashboard_login_submit(
+    request: Request,
+    key: str = Form(...),
+):
+    """
+    Validate the submitted key. On success, set the session cookie and redirect
+    to /dashboard/ui (303 → the browser issues a clean GET, no key in the URL).
+    On failure, re-render the form with an error and HTTP 401.
+    """
+    expected = settings.DASHBOARD_API_KEY
+    if not expected:
+        # No key configured → dashboard is open; nothing to authenticate.
+        return RedirectResponse(url="/dashboard/ui", status_code=303)
+    if hmac.compare_digest(key, expected):
+        response = RedirectResponse(url="/dashboard/ui", status_code=303)
+        _set_session_cookie(response, request, expected)
+        return response
+    return HTMLResponse(_login_html(error="Invalid dashboard key."), status_code=401)
+
+
+@router.get("/logout")
+async def dashboard_logout(request: Request):
+    """Clear the session cookie and return to the login form."""
+    response = RedirectResponse(url="/dashboard/login", status_code=303)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/dashboard")
+    return response
+
+
 @router.get("/data")
 async def dashboard_data(
     db: AsyncSession = Depends(get_db),
     x_dashboard_key: Optional[str] = Header(default=None),
     key: Optional[str] = Query(default=None),
+    eb_dashboard_session: Optional[str] = Cookie(default=None),
 ):
     """Consolidated JSON payload for the visual dashboard (last 30 days)."""
-    if not _key_is_valid(x_dashboard_key or key):
+    if not _is_authorized(x_dashboard_key or key, eb_dashboard_session):
         return JSONResponse({"detail": "Invalid or missing dashboard key"}, status_code=401)
     data = await build_dashboard_data(db)
     return JSONResponse(data)
@@ -415,10 +518,11 @@ async def dashboard_ui(
     db: AsyncSession = Depends(get_db),
     x_dashboard_key: Optional[str] = Header(default=None),
     key: Optional[str] = Query(default=None),
+    eb_dashboard_session: Optional[str] = Cookie(default=None),
 ):
     """Render the visual HTML dashboard (last 30 days)."""
-    if not _key_is_valid(x_dashboard_key or key):
-        return HTMLResponse(_unauthorized_html(), status_code=401)
+    if not _is_authorized(x_dashboard_key or key, eb_dashboard_session):
+        return HTMLResponse(_login_html(error=None), status_code=401)
     data = await build_dashboard_data(db)
     return HTMLResponse(render_html(data))
 
@@ -652,6 +756,7 @@ def render_html(data: dict) -> str:
 </head>
 <body>
 <header>
+  <a class="logout" href="/dashboard/logout">Sign out</a>
   <h1>Earlybird Production Dashboard</h1>
   <p class="subtitle">Last 30 days</p>
   <p class="generated">Generated {generated} UTC · read-only</p>
@@ -738,8 +843,12 @@ _CSS = """
 * { box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
        margin: 0; padding: 0 24px 64px; background: #f6f7f9; color: #1a1f24; line-height: 1.45; }
-header { padding: 28px 0 12px; }
+header { padding: 28px 0 12px; position: relative; }
 h1 { margin: 0; font-size: 28px; }
+.logout { position: absolute; top: 28px; right: 0; font-size: 13px; font-weight: 600;
+          color: #2e6fd2; text-decoration: none; border: 1px solid #cfd6de;
+          border-radius: 8px; padding: 6px 14px; }
+.logout:hover { background: #eef2f8; }
 .subtitle { margin: 4px 0 0; font-size: 16px; color: #5a6470; font-weight: 600; }
 .generated { margin: 4px 0 0; font-size: 12px; color: #8a929c; }
 h2 { font-size: 18px; margin: 32px 0 12px; border-bottom: 2px solid #e3e7ec; padding-bottom: 6px; }
@@ -785,24 +894,60 @@ footer code { background: #eef2f8; padding: 2px 6px; border-radius: 4px; }
   .card-label, .benchmark-grid .muted, .generated, .link-url, footer { color: #9aa4af; }
   .benchmark-rule code, .link-url, footer code { background: #232a32; }
   .copy-btn { background: #232a32; border-color: #3a434d; color: #e6eaef; }
+  .logout { border-color: #3a434d; color: #6ea8fe; }
+  .logout:hover { background: #232a32; }
 }
 """
 
 
-def _unauthorized_html() -> str:
-    return """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Unauthorized — Earlybird</title>
+def _login_html(error: Optional[str] = None) -> str:
+    """
+    Browser login form. The key is POSTed to /dashboard/login and exchanged for
+    a signed session cookie, so it never appears in the URL or browser history.
+    Header (`x-dashboard-key`) and `?key=` access still work for debugging.
+    """
+    error_html = (
+        f'<p class="error">{html.escape(error)}</p>' if error else ""
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — Earlybird Dashboard</title>
 <style>
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+:root {{ color-scheme: light dark; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
        background: #f6f7f9; color: #1a1f24; display: flex; align-items: center;
-       justify-content: center; height: 100vh; margin: 0; }
-.box { text-align: center; background: #fff; border: 1px solid #e3e7ec; border-radius: 12px; padding: 40px 48px; }
-h1 { margin: 0 0 8px; font-size: 22px; }
-p { color: #6b7480; margin: 4px 0 0; }
-code { background: #eef2f8; padding: 2px 6px; border-radius: 4px; }
+       justify-content: center; min-height: 100vh; margin: 0; }}
+.box {{ background: #fff; border: 1px solid #e3e7ec; border-left: 5px solid #2e6fd2;
+       border-radius: 12px; padding: 32px 36px; width: 340px; max-width: 90vw; }}
+h1 {{ margin: 0 0 4px; font-size: 20px; }}
+.sub {{ color: #6b7480; margin: 0 0 20px; font-size: 13px; }}
+label {{ display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }}
+input[type=password] {{ width: 100%; padding: 10px 12px; font-size: 14px;
+       border: 1px solid #cfd6de; border-radius: 8px; background: #fff; color: inherit; }}
+button {{ margin-top: 16px; width: 100%; padding: 10px 12px; font-size: 14px; font-weight: 600;
+       border: none; border-radius: 8px; background: #2e6fd2; color: #fff; cursor: pointer; }}
+button:hover {{ background: #2a63bd; }}
+.error {{ color: #b62b2b; font-size: 13px; margin: 0 0 14px; }}
+.hint {{ color: #8a929c; font-size: 12px; margin: 16px 0 0; }}
+.hint code {{ background: #eef2f8; padding: 2px 6px; border-radius: 4px; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background: #14181d; color: #e6eaef; }}
+  .box {{ background: #1c2128; border-color: #2a313a; }}
+  input[type=password] {{ background: #232a32; border-color: #3a434d; }}
+  .hint code {{ background: #232a32; }}
+}}
 </style></head>
 <body><div class="box">
-<h1>401 · Unauthorized</h1>
-<p>A valid dashboard key is required.</p>
-<p>Provide it via the <code>x-dashboard-key</code> header or a <code>?key=</code> query parameter.</p>
+<h1>Earlybird Dashboard</h1>
+<p class="sub">Sign in to view the last 30 days.</p>
+{error_html}
+<form method="post" action="/dashboard/login">
+  <label for="key">Dashboard key</label>
+  <input type="password" id="key" name="key" autocomplete="current-password" autofocus required>
+  <button type="submit">Sign in</button>
+</form>
+<p class="hint">Your key is exchanged for a session cookie and never appears in the URL.
+For debugging, the <code>x-dashboard-key</code> header and <code>?key=</code> query
+parameter still work.</p>
 </div></body></html>"""
