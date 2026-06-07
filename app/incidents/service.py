@@ -183,6 +183,10 @@ async def find_or_create_incident(
 def _incident_metadata(normalized: NormalizedEventSchema) -> dict:
     """Structured business metadata copied onto a new incident from its first event."""
     return dict(
+        # A normalize-time title (e.g. Stellar structured logs) gives the incident
+        # a readable name pre-LLM; the LLM enrichment still overwrites it later.
+        # None for sources that don't set one, so their behaviour is unchanged.
+        title=normalized.title,
         service=normalized.service,
         endpoint=normalized.endpoint,
         route=normalized.endpoint,

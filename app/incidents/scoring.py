@@ -9,6 +9,7 @@ import os
 from typing import Optional
 from dataclasses import dataclass
 from app.normalizers.base import NormalizedEventSchema
+from app.taxonomy import base_action
 
 # ─── Critical Paths Config ───────────────────────────────────────────────────
 
@@ -118,6 +119,65 @@ def score_freshdesk_awareness(has_existing_tickets: bool) -> int:
     return 20 if not has_existing_tickets else 5
 
 
+# Business actions that ride no HTTP endpoint (so score_critical_path can't see
+# them) but ARE high-impact money/transaction flows. Stellar transaction
+# build/submit lag delays user funds at the settlement layer. Keyed by
+# base_action (see app.taxonomy). Existing endpoint-scored actions are absent
+# here, so endpoint-based scoring is never double-counted.
+_BUSINESS_ACTION_PATHS = {
+    "stellar": {"score": 45, "owner": "stellar"},
+}
+
+
+def score_business_action_path(business_action: Optional[str]) -> tuple[int, Optional[str]]:
+    """
+    Critical-path score for actions identified by business_action rather than by
+    URL endpoint. Returns (0, None) for everything else — including every action
+    that already scores via score_critical_path — so existing scores are unchanged.
+    """
+    cfg = _BUSINESS_ACTION_PATHS.get(base_action(business_action))
+    if cfg:
+        return cfg["score"], cfg["owner"]
+    return 0, None
+
+
+def score_log_level(level: Optional[str]) -> int:
+    """
+    Score the structured-log level (Datadog log events). Only critical/fatal logs
+    add points; ``error`` and below add nothing here (other signals already cover
+    them). Returns 0 when no level was reported, so monitor/Sentry payloads — which
+    never set `level` — are unaffected.
+    """
+    if not level:
+        return 0
+    if str(level).lower() in ("critical", "fatal", "emergency", "alert"):
+        return 40
+    return 0
+
+
+def score_retry_storm(attempts: Optional[int], message: Optional[str]) -> int:
+    """
+    Score a retry storm / message-store lag: a very high attempt count or an
+    explicit "retried too many times" signal means user transactions are wedged.
+    Returns 0 when neither is present, so existing payloads (no `attempts`, no such
+    message) are unaffected.
+    """
+    score = 0
+    a = attempts or 0
+    if a >= 500:
+        score = 35
+    elif a >= 100:
+        score = 25
+    elif a >= 25:
+        score = 15
+    elif a >= 10:
+        score = 10
+    msg = (message or "").lower()
+    if "retried too many times" in msg or "too many times" in msg or "max retries" in msg:
+        score = max(score, 30)
+    return score
+
+
 # ─── Main Scorer ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -151,6 +211,13 @@ def calculate_criticality(
     (errors/min basis). When None we fall back to the cumulative event_count.
     """
     path_score, owner = score_critical_path(event.endpoint)
+    # A high-impact action that rides no HTTP endpoint (e.g. Stellar transaction
+    # lag) is treated as a critical path too — only when the endpoint didn't
+    # already match one, so existing endpoint-scored incidents never change.
+    if path_score == 0:
+        ba_score, ba_owner = score_business_action_path(event.business_action)
+        if ba_score:
+            path_score, owner = ba_score, ba_owner
     user_score = score_affected_users(affected_users)
     velocity_score = score_error_velocity(
         events_in_window if events_in_window is not None else event_count
@@ -158,6 +225,11 @@ def calculate_criticality(
     status_score = score_http_status(event.http_status)
     country_score = score_country_concentration(countries or [])
     freshdesk_score = score_freshdesk_awareness(has_existing_tickets)
+    # New structured-log signals. Both return 0 for monitor/Sentry/product
+    # payloads (which carry neither `level` nor `attempts`), so all existing
+    # scores are byte-for-byte unchanged.
+    log_level_score = score_log_level(getattr(event, "level", None))
+    retry_score = score_retry_storm(getattr(event, "attempts", None), event.message)
 
     total = (
         path_score
@@ -166,6 +238,8 @@ def calculate_criticality(
         + status_score
         + country_score
         + freshdesk_score
+        + log_level_score
+        + retry_score
     )
 
     breakdown = {
@@ -175,9 +249,17 @@ def calculate_criticality(
         "http_status": status_score,
         "country_concentration": country_score,
         "freshdesk_awareness": freshdesk_score,
+        "log_level": log_level_score,
+        "retry_storm": retry_score,
     }
 
     severity = _score_to_severity(total)
+    # A critical/fatal log level must surface as at least high severity even if the
+    # numeric total lands lower. Scoped to events that report level=critical, so
+    # nothing else is affected.
+    if getattr(event, "level", None) and str(event.level).lower() in ("critical", "fatal"):
+        if severity not in ("critical", "high"):
+            severity = "high"
 
     return ScoringResult(
         total_score=total,
