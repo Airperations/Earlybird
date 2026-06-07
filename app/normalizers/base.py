@@ -36,6 +36,16 @@ class NormalizedEventSchema:
     provider: Optional[str] = None          # payment / infra provider, e.g. "stripe"
     payment_method: Optional[str] = None    # e.g. "card", "bank_transfer", "crypto"
     business_action: Optional[str] = None   # e.g. "withdrawal_failed" (see app.taxonomy)
+    # Additive fields for structured-log sources (e.g. Datadog Stellar events).
+    # All optional with defaults so every existing normalizer call is unaffected.
+    event_id: Optional[str] = None          # provider event id (or trace/span fallback)
+    title: Optional[str] = None             # human title built at normalize time
+    error_message: Optional[str] = None     # nested error.message, kept distinct from `message`
+    level: Optional[str] = None             # log level: error | critical | warning | …
+    attempts: Optional[int] = None          # retry/attempt count, when the source reports it
+    # Non-PII structured metadata preserved for the audit trail. NEVER contains a
+    # raw stack trace, user id, email, or secret (see _structured_log_metadata).
+    metadata: dict = field(default_factory=dict)
 
 
 def normalize_sentry(payload: dict) -> NormalizedEventSchema:
@@ -120,7 +130,15 @@ def normalize_datadog(payload: dict) -> NormalizedEventSchema:
       • a JSON object          {"service": "payments-api", "country": "MX"}
     A *custom* webhook payload (recommended) can additionally send first-class
     ``url`` / ``endpoint`` / ``business_action`` / ``service`` / ``env`` fields.
+
+    A second, structured-log shape (Datadog log pipelines forwarding app JSON,
+    e.g. the Stellar transaction handlers) carries a ``dd`` reserved-attributes
+    block and a nested ``error`` object instead of monitor fields. It is detected
+    and mapped separately so the monitor path above is never disturbed.
     """
+    if _is_structured_log_event(payload):
+        return _normalize_datadog_structured_log(payload)
+
     tags = _parse_tags(payload.get("tags"))
 
     # Title/message fall back across the standard monitor fields and a custom one.
@@ -138,10 +156,21 @@ def normalize_datadog(payload: dict) -> NormalizedEventSchema:
     # alert_type / alert_status describe the monitor transition (error / warning…).
     exception_type = payload.get("alert_type") or payload.get("alert_status")
 
-    business_action = (
-        payload.get("business_action")
-        or tags.get("business_action")
-        or derive_business_action(endpoint, http_status, exception_type)
+    # Business action: an explicit field wins; otherwise recognise a Stellar
+    # transaction monitor (e.g. "Stellar Message Store Lag on
+    # stellar-cosmoem-buildtransaction - BuildTransaction") from its title/tags so
+    # it isn't mis-derived as withdrawal/payment; finally fall back to the
+    # endpoint-based derivation. A non-Stellar monitor sees no behaviour change.
+    business_action = payload.get("business_action") or tags.get("business_action")
+    stellar_action = None
+    if not business_action:
+        stellar_action = _stellar_action_from_monitor(payload, tags, message)
+        business_action = stellar_action or derive_business_action(endpoint, http_status, exception_type)
+
+    provider = (
+        ("stellar" if stellar_action else None)
+        or tags.get("provider")
+        or payload.get("provider")
     )
 
     fingerprint = _build_fingerprint(
@@ -167,9 +196,192 @@ def normalize_datadog(payload: dict) -> NormalizedEventSchema:
         fingerprint=fingerprint,
         raw_payload=payload,
         event_timestamp=_parse_iso(payload.get("timestamp") or payload.get("date")),
-        provider=tags.get("provider") or payload.get("provider"),
+        provider=provider,
         payment_method=tags.get("payment_method") or payload.get("payment_method"),
         business_action=business_action,
+    )
+
+
+# ─── Datadog Stellar / structured-log support ─────────────────────────────────
+
+# Signals that mark a payload as a Stellar transaction event, across both the
+# structured-log shape and the metric-monitor shape (title/tags). Matched as
+# lower-cased substrings, so "stellar-cosmoem-buildtransaction" and the camelCase
+# type "BuildTransaction" both hit.
+_STELLAR_SIGNALS = (
+    "stellar",
+    "buildtransaction",
+    "submittransaction",
+    "message store lag",
+)
+
+
+def _is_structured_log_event(payload: dict) -> bool:
+    """
+    True for the app-JSON structured-log shape Datadog forwards from log pipelines
+    (a ``dd`` reserved-attributes block and/or a nested ``error`` object, or the
+    message-store stream fields). The monitor/custom-webhook shape has none of
+    these, so the existing monitor path is never rerouted.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("dd"), dict):
+        return True
+    if isinstance(payload.get("error"), dict):
+        return True
+    return any(payload.get(k) for k in ("streamName", "consumerGroupId"))
+
+
+def _lookup(payload: dict, tags: dict, *keys):
+    """First present, non-empty value across payload then tags, for any key form
+    (camelCase ``consumerGroupId``, snake ``consumer_group_id``, dotted tag
+    ``consumer_group_id.name``)."""
+    for src in (payload, tags):
+        if not isinstance(src, dict):
+            continue
+        for k in keys:
+            v = src.get(k)
+            if v not in (None, ""):
+                return v
+    return None
+
+
+def _looks_stellar(blob: str) -> bool:
+    b = (blob or "").lower()
+    return any(sig in b for sig in _STELLAR_SIGNALS)
+
+
+def _classify_stellar_action(blob: str) -> str:
+    """
+    Pick the Stellar business action from the combined signal text. Lag/retry
+    storms win over build/submit (a lag monitor is fundamentally about delay).
+    All of these resolve to base_action "stellar" (see app.taxonomy).
+    """
+    b = (blob or "").lower()
+    if ("lag" in b or "retried too many times" in b or "too many times" in b
+            or "delayed" in b or "delay" in b or "stuck" in b):
+        return "stellar_lag"
+    if "submit" in b:
+        return "stellar_transaction_submit"
+    if "build" in b:
+        return "stellar_transaction_build"
+    return "stellar_transaction"
+
+
+def _stellar_action_from_monitor(payload: dict, tags: dict, message: str):
+    """Detect a Stellar transaction monitor from its title / tags / dimensions.
+    Returns a stellar_* business action, or None when no Stellar signal is found."""
+    title = payload.get("title") or payload.get("alert_title") or ""
+    consumer = _lookup(payload, tags, "consumerGroupId", "consumer_group_id",
+                       "consumer_group_id.name", "consumerGroup", "consumer_group") or ""
+    category = _lookup(payload, tags, "category", "category.name", "categoryName") or ""
+    type_ = payload.get("type") or _lookup(payload, tags, "type", "type.name") or ""
+    stream = payload.get("streamName") or payload.get("namespace") or ""
+    tag_values = " ".join(str(v) for v in tags.values()) if isinstance(tags, dict) else ""
+    blob = " ".join(str(x) for x in [title, message, consumer, category, type_, stream, tag_values] if x)
+    if not _looks_stellar(blob):
+        return None
+    return _classify_stellar_action(blob)
+
+
+def _build_stellar_title(message: str, type_: str, category: str, service: str) -> str:
+    """Human title, e.g. 'Stellar BuildTransaction — message has been retried too many times'."""
+    label = type_ or category or service or "transaction"
+    msg = (message or "").strip()
+    head = f"Stellar {label}".strip()
+    return f"{head} — {msg}" if msg else head
+
+
+def _structured_log_metadata(payload: dict, dd: dict) -> dict:
+    """
+    Preserve useful, NON-PII fields for the audit trail. Deliberately excludes the
+    raw stack trace, any user id/email, and secrets — so nothing sensitive can
+    reach a dashboard-visible field. None values are dropped.
+    """
+    candidates = {
+        "consumerGroupId": payload.get("consumerGroupId"),
+        "consumerGroupMember": payload.get("consumerGroupMember"),
+        "consumerGroupSize": payload.get("consumerGroupSize"),
+        "category": payload.get("category"),
+        "namespace": payload.get("namespace"),
+        "streamName": payload.get("streamName"),
+        "type": payload.get("type"),
+        "attempts": _safe_int(payload.get("attempts")),
+        "level": payload.get("level"),
+        "dd.env": dd.get("env"),
+        "dd.service": dd.get("service"),
+        "dd.version": dd.get("version"),
+        "dd.trace_id": dd.get("trace_id"),
+        "dd.span_id": dd.get("span_id"),
+    }
+    return {k: v for k, v in candidates.items() if v is not None}
+
+
+def _normalize_datadog_structured_log(payload: dict) -> NormalizedEventSchema:
+    """Map the Datadog Stellar structured-log shape (dd + error + stream fields)."""
+    dd = payload.get("dd") if isinstance(payload.get("dd"), dict) else {}
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    tags = _parse_tags(payload.get("tags"))
+
+    service = payload.get("service") or dd.get("service") or tags.get("service") or "unknown"
+    environment = dd.get("env") or payload.get("env") or tags.get("env") or "production"
+    event_id = payload.get("id") or dd.get("trace_id") or dd.get("span_id")
+    level = str(payload.get("level")).lower() if payload.get("level") else None
+    attempts = _safe_int(payload.get("attempts"))
+
+    category = payload.get("category") or _lookup(payload, tags, "category", "category.name") or ""
+    namespace = payload.get("namespace") or ""
+    type_ = payload.get("type") or ""
+    stream = payload.get("streamName") or ""
+    consumer = _lookup(payload, tags, "consumerGroupId", "consumer_group_id",
+                       "consumer_group_id.name") or ""
+    top_message = payload.get("message") or ""
+    error_message = error.get("message")
+    exception_type = error.get("name")
+
+    # endpoint/operation: namespace preferred (it names the operation), else the
+    # category/type. The raw stack trace is never used here.
+    endpoint = namespace or category or type_ or ""
+
+    blob = " ".join(str(x) for x in [category, stream, type_, top_message, consumer, error_message] if x)
+    if _looks_stellar(blob):
+        business_action = _classify_stellar_action(blob)
+        provider = "stellar"
+    else:
+        # Not a Stellar event — degrade to endpoint derivation (may be None).
+        business_action = derive_business_action(endpoint, None, exception_type)
+        provider = None
+
+    title = _build_stellar_title(top_message, type_, category, service)
+    fingerprint = _build_fingerprint(
+        service=service, endpoint=endpoint, http_status=None, exception_type=exception_type,
+    )
+
+    return NormalizedEventSchema(
+        source="datadog",
+        service=service,
+        environment=environment,
+        endpoint=endpoint,
+        url="",
+        http_status=None,
+        exception_type=exception_type,
+        message=title or top_message or error_message,
+        user_id=None,
+        country=tags.get("country") or payload.get("country"),
+        platform=tags.get("platform") or payload.get("platform"),
+        release=dd.get("version") or payload.get("version"),
+        fingerprint=fingerprint,
+        raw_payload=payload,
+        event_timestamp=_parse_iso(payload.get("timestamp") or payload.get("time")),
+        provider=provider,
+        payment_method=None,
+        business_action=business_action,
+        event_id=event_id,
+        title=title,
+        error_message=error_message,
+        level=level,
+        attempts=attempts,
+        metadata=_structured_log_metadata(payload, dd),
     )
 
 

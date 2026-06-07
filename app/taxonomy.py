@@ -76,6 +76,18 @@ KEYWORD_GROUPS: Dict[str, Dict[str, List[str]]] = {
         "en": ["direct withdraw", "direct withdrawal", "instant withdraw", "instant withdrawal"],
         "es": ["retiro directo", "retiro inmediato"],
     },
+    # Stellar / on-chain transaction processing (Datadog structured-log source).
+    # A money-flow at the settlement layer: build/submit lag or failure here
+    # delays user transactions just like a /withdraw outage does.
+    "stellar": {
+        "en": ["stellar", "stellar transaction", "build transaction", "transaction lag",
+               "transaction delayed", "transaction failed", "transaction stuck",
+               "on-chain", "blockchain transaction", "xlm"],
+        "es": ["transacción stellar", "transaccion stellar", "transacción retrasada",
+               "transaccion retrasada", "transacción demorada", "transaccion demorada",
+               "transacción fallida", "transaccion fallida", "transacción atascada",
+               "transaccion atascada"],
+    },
     # Modifier groups — describe the *failure mode*, combine with an action above.
     "pending": {
         "en": ["pending", "stuck", "still processing", "not received yet"],
@@ -90,7 +102,7 @@ KEYWORD_GROUPS: Dict[str, Dict[str, List[str]]] = {
 # Groups that name a business action (vs. a failure modifier).
 ACTION_GROUPS = (
     "withdrawal", "direct_withdraw", "deposit", "transfer", "p2p", "balance",
-    "login", "payment", "signup", "virtual_account", "virtual_card",
+    "login", "payment", "signup", "virtual_account", "virtual_card", "stellar",
 )
 # Money-flow actions where even a small absolute sample is meaningful (lower the
 # baseline sample-size bar so a handful of failures can still trip).
