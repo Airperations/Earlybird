@@ -250,6 +250,59 @@ def test_stellar_camelcase_monitor_fields_recognised():
     assert n.provider == "stellar"
 
 
+def _stellar_lag_monitor_payload() -> dict:
+    """The real Datadog 'Stellar Message Store Lag' monitor shape (redacted)."""
+    return {
+        "env": "production",
+        "url": "https://app.datadoghq.com/event/event?id=123456",
+        "tags": "category:stellartransaction:command,consumer_group_id:stellar-cosmoem-buildtransaction,monitor",
+        "title": "[Warn on {consumer_group_id:stellar-cosmoem-buildtransaction}] Stellar Message Store Lag on stellar-cosmoem-buildtransaction - stellartransaction:command",
+        "source": "datadog",
+        "message": "... **airtm.message_store.lag** over **category:stellartransaction:command,consumer_group_id:stellar-cosmoem-buildtransaction** was **> 200.0** on average during the **last 15m** ...",
+        "event_id": "123456",
+        "timestamp": "1700000000",
+        "monitor_id": "987654",
+        "alert_status": "airtm.message_store.lag over category:stellartransaction:command was > 200.0 on average during the last 15m.",
+        "monitor_name": "Stellar Message Store Lag on stellar-cosmoem-buildtransaction - stellartransaction:command",
+    }
+
+
+def test_stellar_lag_monitor_display_metadata():
+    """A real Stellar Message Store Lag monitor gets friendly service/endpoint and
+    keeps the event URL as a link — without faking region or user counts."""
+    n = normalize("datadog", _stellar_lag_monitor_payload())
+
+    # Classification unchanged.
+    assert n.business_action == "stellar_lag"
+    assert n.provider == "stellar"
+
+    # Service from consumer_group_id; endpoint from the metric, NOT /event/event.
+    assert n.service == "stellar-cosmoem-buildtransaction"
+    assert n.endpoint == "airtm.message_store.lag"
+    assert n.endpoint != "/event/event"
+
+    # The Datadog event URL is preserved separately (not lost, not the endpoint).
+    assert n.url == "https://app.datadoghq.com/event/event?id=123456"
+    assert n.metadata["datadog_url"] == "https://app.datadoghq.com/event/event?id=123456"
+
+    # Tags preserved in metadata.
+    assert n.metadata["category"] == "stellartransaction:command"
+    assert n.metadata["consumer_group_id"] == "stellar-cosmoem-buildtransaction"
+    assert n.metadata["metric"] == "airtm.message_store.lag"
+
+    # No invented region / users.
+    assert n.country is None
+    assert n.user_id is None
+
+
+def test_stellar_lag_monitor_tags_string_parses_multi_colon_value():
+    """`category:stellartransaction:command` keeps the full value (split on first ':')."""
+    from app.normalizers.base import _parse_tags
+    tags = _parse_tags("category:stellartransaction:command,consumer_group_id:stellar-cosmoem-buildtransaction,monitor")
+    assert tags["category"] == "stellartransaction:command"
+    assert tags["consumer_group_id"] == "stellar-cosmoem-buildtransaction"
+
+
 def test_non_stellar_datadog_monitor_is_unchanged():
     """A plain withdrawal monitor must keep its existing classification."""
     n = normalize("datadog", {
