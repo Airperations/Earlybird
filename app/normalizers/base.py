@@ -150,8 +150,6 @@ def normalize_datadog(payload: dict) -> NormalizedEventSchema:
         or ""
     )
     url = payload.get("url", "") or ""
-    endpoint = _extract_endpoint(url) or payload.get("endpoint", "")
-    service = payload.get("service") or tags.get("service") or "unknown"
     http_status = _safe_int(payload.get("http_status") or tags.get("http_status_code"))
     # alert_type / alert_status describe the monitor transition (error / warning…).
     exception_type = payload.get("alert_type") or payload.get("alert_status")
@@ -165,6 +163,31 @@ def normalize_datadog(payload: dict) -> NormalizedEventSchema:
     stellar_action = None
     if not business_action:
         stellar_action = _stellar_action_from_monitor(payload, tags, message)
+
+    # Service & endpoint. For a Stellar lag monitor the raw Datadog event URL path
+    # ("/event/event") and "unknown" service are useless on a Slack alert, so we
+    # derive friendlier values from the monitor's tags/metric. Non-Stellar monitors
+    # keep their existing URL-derived endpoint and tag/payload service untouched.
+    metadata: dict = {}
+    if stellar_action:
+        consumer_group_id = _lookup(payload, tags, "consumer_group_id",
+                                    "consumerGroupId", "consumer_group_id.name")
+        metric = _stellar_metric_name(payload)
+        service = payload.get("service") or consumer_group_id or tags.get("service") or "unknown"
+        endpoint = metric or _extract_endpoint(url) or payload.get("endpoint", "")
+        metadata = {k: v for k, v in {
+            "category": _lookup(payload, tags, "category", "category.name"),
+            "consumer_group_id": consumer_group_id,
+            "metric": metric,
+            "monitor_id": payload.get("monitor_id"),
+            "monitor_name": payload.get("monitor_name"),
+            "datadog_url": url or None,  # keep the event URL as a link, not the endpoint
+        }.items() if v}
+    else:
+        service = payload.get("service") or tags.get("service") or "unknown"
+        endpoint = _extract_endpoint(url) or payload.get("endpoint", "")
+
+    if not business_action:
         business_action = stellar_action or derive_business_action(endpoint, http_status, exception_type)
 
     provider = (
@@ -199,6 +222,7 @@ def normalize_datadog(payload: dict) -> NormalizedEventSchema:
         provider=provider,
         payment_method=tags.get("payment_method") or payload.get("payment_method"),
         business_action=business_action,
+        metadata=metadata,
     )
 
 
@@ -269,19 +293,42 @@ def _classify_stellar_action(blob: str) -> str:
 
 
 def _stellar_action_from_monitor(payload: dict, tags: dict, message: str):
-    """Detect a Stellar transaction monitor from its title / tags / dimensions.
-    Returns a stellar_* business action, or None when no Stellar signal is found."""
+    """Detect a Stellar transaction monitor from its title / monitor_name / tags /
+    dimensions. Returns a stellar_* business action, or None when no Stellar signal
+    is found."""
     title = payload.get("title") or payload.get("alert_title") or ""
+    monitor_name = payload.get("monitor_name") or ""
     consumer = _lookup(payload, tags, "consumerGroupId", "consumer_group_id",
                        "consumer_group_id.name", "consumerGroup", "consumer_group") or ""
     category = _lookup(payload, tags, "category", "category.name", "categoryName") or ""
     type_ = payload.get("type") or _lookup(payload, tags, "type", "type.name") or ""
     stream = payload.get("streamName") or payload.get("namespace") or ""
     tag_values = " ".join(str(v) for v in tags.values()) if isinstance(tags, dict) else ""
-    blob = " ".join(str(x) for x in [title, message, consumer, category, type_, stream, tag_values] if x)
+    blob = " ".join(str(x) for x in [title, monitor_name, message, consumer,
+                                     category, type_, stream, tag_values] if x)
     if not _looks_stellar(blob):
         return None
     return _classify_stellar_action(blob)
+
+
+# Datadog metric names look like dotted identifiers, e.g. "airtm.message_store.lag".
+_METRIC_NAME_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+)+\b")
+
+
+def _stellar_metric_name(payload: dict):
+    """
+    Pull the underlying metric (e.g. ``airtm.message_store.lag``) from the
+    monitor's ``alert_status`` / ``message`` / ``monitor_name`` so it can be the
+    human-readable endpoint instead of the Datadog event URL path. Returns None
+    when no dotted metric name is present.
+    """
+    for text in (payload.get("alert_status"), payload.get("message"), payload.get("monitor_name")):
+        if not text:
+            continue
+        m = _METRIC_NAME_RE.search(str(text))
+        if m:
+            return m.group(0)
+    return None
 
 
 def _build_stellar_title(message: str, type_: str, category: str, service: str) -> str:
